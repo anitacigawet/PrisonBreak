@@ -1,0 +1,11 @@
+# PrisonBreak local RAG worker.
+#
+# Install from the repository root:
+#   python -m pip install -r server/rag/requirements.txt
+#
+# FastEmbed performs embedding inference locally. The selected model may need
+# to be downloaded on first use and is then cached on disk.
+
+qdrant-client>=1.12,<2.0
+fastembed>=0.6,<1.0
+pypdf>=5.0,<7.0
