@@ -20,7 +20,7 @@ import type {
   DefenderReading,
   TrialVerdict,
 } from "../types";
-import { assertGroundedCitations, collectGroundedCitations } from "../grounding";
+import { assertHandoffCitations, collectGroundedCitations } from "../grounding";
 
 const RESPONSE_SCHEMA = toOpenAISchema(
   DefenderHandoffSchema,
@@ -83,10 +83,9 @@ export async function runTranslatorPass(opts: TranslatorOpts): Promise<DefenderH
 
   const text = response.kind === "text" ? response.text : response.text ?? "";
   const handoff = parsePassJson<DefenderHandoff>(text, "translator", DefenderHandoffSchema);
-  assertGroundedCitations(
+  assertHandoffCitations(
     handoff,
     collectGroundedCitations(opts.verdict),
-    "Defender Handoff translator",
   );
   return handoff;
 }

@@ -31,8 +31,8 @@ export const petalsRouter = router({
 
   start: publicProcedure
     .input(z.object({ caseId: z.number() }))
-    .mutation(({ input }) => {
-      startPetalGrowth(input.caseId);
+    .mutation(async ({ input }) => {
+      await startPetalGrowth(input.caseId);
       return { started: true, caseId: input.caseId };
     }),
 });

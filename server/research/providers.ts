@@ -1,4 +1,15 @@
 import type { ResearchProvider } from "./types";
+import { ResearchConfigurationError } from "./errors";
+
+export function assertResearchProviderIsolated(provider: ResearchProvider): void {
+  if (provider === "codex") {
+    throw new ResearchConfigurationError(
+      "Codex research is disabled until its web-only tool and filesystem isolation can be verified. " +
+      "A read-only sandbox does not prevent local file reads. Configure PRISONBREAK_RESEARCH_PROVIDER=claude " +
+      "with Claude Code signed in to use the restricted WebSearch/WebFetch workflow. No provider was switched automatically.",
+    );
+  }
+}
 
 export interface ProviderCommand {
   executable: string;
@@ -27,35 +38,8 @@ export function getProviderExecutable(
 export function buildProviderCommand(
   options: ProviderCommandOptions
 ): ProviderCommand {
+  assertResearchProviderIsolated(options.provider);
   const executable = getProviderExecutable(options.provider, options.env);
-
-  if (options.provider === "codex") {
-    return {
-      executable,
-      args: [
-        "--search",
-        "--ask-for-approval",
-        "never",
-        "exec",
-        "--sandbox",
-        "read-only",
-        "--ephemeral",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--skip-git-repo-check",
-        "--cd",
-        options.workDir,
-        "--output-schema",
-        options.schemaPath,
-        "--output-last-message",
-        options.resultPath,
-        "--color",
-        "never",
-        "-",
-      ],
-      resultPath: options.resultPath,
-    };
-  }
 
   return {
     executable,

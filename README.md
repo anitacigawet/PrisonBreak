@@ -4,7 +4,7 @@
 
 ## What is this?
 
-PrisonBreak is an extremely experimental case-reading workspace for individuals attempting to understand a criminal case record. It organizes case documents in a local Qdrant RAG database, keeps extracted facts tied to their source passages, and can use Codex CLI or Claude CLI to find official material on the web. It compares a prosecutor reading and a defense reading of the same retained material, then produces a concise handoff ready for immediate attorney review.
+PrisonBreak is an extremely experimental case-reading workspace for individuals attempting to understand a criminal case record. It organizes case documents in a local Qdrant RAG database, keeps extracted facts tied to their source passages, and can use Claude CLI to find official material on the web. It compares a prosecutor reading and a defense reading of the same retained material, then produces a concise handoff ready for immediate attorney review.
 
 It is currently a working beta and is not in any way, shape, or form a legal service. It does not in any way, shape, or form predict outcomes, create an attorney-client relationship, or replace any type of qualified counsel.
 
@@ -20,7 +20,7 @@ It is currently a working beta and is not in any way, shape, or form a legal ser
 PrisonBreak is not a simple chatbot. It separates three different structures of work:
 
 1. **Source retrieval.** Uploaded documents become a case corpus inside a local Qdrant RAG database. PrisonBreak extracts facts with citations so a reviewer can follow each retained fact directly back to its source passage and location.
-2. **Case analysis and search.** The case record is used to identify focused research questions. A locally invoked Codex or Claude CLI searches for primary legal and government sources. PrisonBreak then fetches those sources itself, stores local snapshots, records their URLs and content hashes, and indexes the retained text into separate research corpora.
+2. **Case analysis and search.** The case record is used to identify focused research questions. A locally invoked Claude CLI searches for primary legal and government sources. PrisonBreak then fetches those sources itself, stores local snapshots, records their URLs and content hashes, and indexes the retained text into separate research corpora.
 3. **Grounded comparison.** PrisonBreak conducts a “prosecutor pass” and a “defense pass” over the same case material. It battles those readings out alongside the web-acquired research in a RAG-grounded clean room, comparing where they agree, disagree, or depend on narrow factual or legal pivots. The result is a map of the disputes, not a prediction.
 
 The resulting “Take-to-Trial” view is for understanding. A separate “Defender Handoff” translates the most actionable points into no more than three RAG-cited, source-linked questions that can be printed and given to qualified legal counsel.
@@ -45,18 +45,33 @@ Research is organized into bounded corpora for laws, controlling cases, procedur
 
 ## Running it locally
 
+This public distribution supports fresh installs only. Do not point it at a
+database created by an older private-development build. If you are continuing
+maintenance work rather than installing the application, read
+[START_HERE.md](START_HERE.md) first.
+
 Requirements:
 
-- Node.js 22 or newer
+- Node.js 22.12 or newer
 - pnpm 10
 - Python 3.11 or newer
-- Codex CLI or Claude CLI for web research
+- Claude Code CLI for web research
 - An Anthropic or OpenAI API key for fact extraction and the comparison passes
+
+On Windows, the release launcher is the shortest supported path:
+
+```powershell
+git clone https://github.com/anitacigawet/PrisonBreak.git
+Set-Location PrisonBreak
+.\launch.bat
+```
+
+For a manual installation:
 
 ```bash
 git clone https://github.com/anitacigawet/PrisonBreak.git
 cd PrisonBreak
-pnpm install
+pnpm install --frozen-lockfile
 python -m venv .venv-rag
 ```
 
@@ -74,7 +89,8 @@ On macOS or Linux:
 cp .env.example .env
 ```
 
-Set `PRISONBREAK_PYTHON` and `PRISONBREAK_RESEARCH_PROVIDER` in `.env`, then start the app:
+Set `PRISONBREAK_PYTHON` to the interpreter inside `.venv-rag` and set
+`PRISONBREAK_RESEARCH_PROVIDER` to `claude`, then start the app:
 
 ```bash
 pnpm dev
@@ -93,18 +109,18 @@ See [the self-hosting guide](docs/SELF_HOSTING.md) for the complete setup and da
 - FastEmbed creates embeddings locally using `BAAI/bge-small-en-v1.5` by default.
 - Qdrant runs in persistent local mode under `data/qdrant/`.
 - Every retrieved chunk carries a stable citation ID, source identity, content hash, locator, and verbatim passage.
-- Codex CLI or Claude CLI performs live web discovery. PrisonBreak independently fetches the returned official sources before admitting them to the research index.
+- Claude CLI performs live web discovery with only WebSearch and WebFetch enabled. The Codex research path is disabled until its web-only isolation is verified; it does not silently switch providers. PrisonBreak independently fetches the returned official sources before admitting them to the research index.
 - Anthropic or OpenAI performs structured fact extraction and the prosecutor, defense, synthesis, and handoff passes. Those model calls are network-backed.
 - SQLite stores cases, document metadata, research-source ledgers, analysis results, notes, and settings.
 
-Local storage is not the same as local-only processing. Case excerpts and prompts can be sent to the configured Anthropic or OpenAI provider. Web research uses the selected Codex or Claude CLI and therefore also uses that provider's network service. Review provider policies and any confidentiality, privilege, retention, or professional obligations that apply before using sensitive material.
+Local storage is not the same as local-only processing. Case excerpts and prompts can be sent to the configured Anthropic or OpenAI provider. Web research uses Claude CLI and therefore also uses that provider's network service. Review provider policies and any confidentiality, privilege, retention, or professional obligations that apply before using sensitive material.
 
 ### Project structure
 
 ```text
 client/                 React interface
 server/rag/             Local parsing, FastEmbed, and Qdrant retrieval
-server/research/        Codex/Claude CLI web-research bridge
+server/research/        Restricted CLI web-research bridge
 server/sources/         Independent source fetching and snapshots
 server/petals/          Bounded research-corpus builders
 server/orchestrator/    Prosecutor, defense, synthesis, and handoff passes

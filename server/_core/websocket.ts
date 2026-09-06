@@ -1,15 +1,28 @@
 import { Server as HTTPServer } from "http";
 import { Server as SocketIOServer } from "socket.io";
+import { getCaseById } from "../db";
+import type { LocalSecurity } from "./localSecurity";
 
 let io: SocketIOServer | null = null;
 
-export function initializeWebSocket(httpServer: HTTPServer) {
+export function initializeWebSocket(httpServer: HTTPServer, security: LocalSecurity, canJoin = async (caseId: number) => {
+  const record = await getCaseById(caseId);
+  return Boolean(record && record.deletionState === "active");
+}) {
   io = new SocketIOServer(httpServer, {
     cors: {
-      origin: "*",
+      origin: (origin, callback) => callback(null, security.isAllowedOrigin(origin)),
       methods: ["GET", "POST"],
+      credentials: true,
     },
     path: "/api/socket.io",
+    allowRequest: (req, callback) => callback(null, security.authorize(req)),
+  });
+
+  // Engine.IO handles upgrades and polling outside Express. Check every request,
+  // not only the first handshake of a session.
+  io.engine.use((req: import("node:http").IncomingMessage, _res: unknown, next: (error?: Error) => void) => {
+    next(security.authorize(req) ? undefined : new Error("Local session required"));
   });
 
   io.on("connection", (socket) => {
@@ -20,12 +33,21 @@ export function initializeWebSocket(httpServer: HTTPServer) {
     });
 
     // Join case-specific room for targeted updates
-    socket.on("join-case", (caseId: number) => {
-      socket.join(`case-${caseId}`);
-      console.log(`[WebSocket] Client ${socket.id} joined case-${caseId}`);
+    socket.on("join-case", async (caseId: unknown, acknowledge?: (result: { ok: boolean }) => void) => {
+      const respond = (ok: boolean) => { if (typeof acknowledge === "function") acknowledge({ ok }); };
+      if (typeof caseId !== "number" || !Number.isSafeInteger(caseId) || caseId <= 0) { respond(false); return; }
+      try {
+        const allowed = await canJoin(caseId) && socket.connected;
+        if (allowed) await socket.join(`case-${caseId}`);
+        respond(allowed);
+      } catch {
+        respond(false);
+        socket.emit("case-unavailable", { caseId });
+      }
     });
 
     socket.on("leave-case", (caseId: number) => {
+      if (!Number.isSafeInteger(caseId) || caseId <= 0) return;
       socket.leave(`case-${caseId}`);
       console.log(`[WebSocket] Client ${socket.id} left case-${caseId}`);
     });

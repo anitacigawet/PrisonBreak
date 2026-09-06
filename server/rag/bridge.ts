@@ -7,9 +7,13 @@
  */
 import { spawn } from "node:child_process";
 import * as path from "node:path";
+import { getDataRoot } from "../runtimePaths";
 
 import type {
   RagBridgeOptions,
+  RagDeleteCaseInput,
+  RagDeleteCorpusInput,
+  RagDeleteScopeResult,
   RagDeleteSourceInput,
   RagDeleteSourceResult,
   RagHealthResult,
@@ -25,6 +29,8 @@ type WorkerAction =
   | "upsert_file"
   | "upsert_text"
   | "delete_source"
+  | "delete_case"
+  | "delete_corpus"
   | "query";
 
 interface WorkerEnvelope<T> {
@@ -40,6 +46,9 @@ interface WorkerRequest {
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1_000;
+const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
 
 function definedEntries(
   entries: Array<[string, unknown]>
@@ -51,7 +60,7 @@ export class LocalRagBridge {
   private readonly options: RagBridgeOptions;
   private queue: Promise<void> = Promise.resolve();
 
-  constructor(options: RagBridgeOptions = {}) {
+  constructor(options: RagBridgeOptions = {}, private readonly spawnWorker: typeof spawn = spawn) {
     this.options = options;
   }
 
@@ -69,6 +78,21 @@ export class LocalRagBridge {
 
   deleteSource(input: RagDeleteSourceInput): Promise<RagDeleteSourceResult> {
     return this.request<RagDeleteSourceResult>("delete_source", input);
+  }
+
+  deleteCase(input: RagDeleteCaseInput): Promise<RagDeleteScopeResult> {
+    this.validateDeletionCase(input.caseId);
+    return this.request<RagDeleteScopeResult>("delete_case", input);
+  }
+
+  deleteCorpus(input: RagDeleteCorpusInput): Promise<RagDeleteScopeResult> {
+    this.validateDeletionCase(input.caseId);
+    if (typeof input.corpus !== "string" || !input.corpus.trim()) throw new Error("A corpus is required");
+    return this.request<RagDeleteScopeResult>("delete_corpus", input);
+  }
+
+  private validateDeletionCase(caseId: unknown): void {
+    if (!/^[1-9][0-9]*$/.test(String(caseId)) || !Number.isSafeInteger(Number(caseId))) throw new Error("Deletion requires a positive integer case ID");
   }
 
   query(input: RagQueryInput): Promise<RagQueryResult> {
@@ -114,11 +138,11 @@ export class LocalRagBridge {
     const repoRoot = path.resolve(this.options.repoRoot ?? process.cwd());
     const storePath = path.resolve(
       repoRoot,
-      this.options.storePath ?? path.join("data", "qdrant")
+      this.options.storePath ?? process.env.PRISONBREAK_QDRANT_PATH ?? path.join(getDataRoot(), "qdrant")
     );
     const modelCachePath = this.options.modelCachePath
       ? path.resolve(repoRoot, this.options.modelCachePath)
-      : undefined;
+      : process.env.PRISONBREAK_FASTEMBED_CACHE ?? path.join(getDataRoot(), "fastembed");
 
     return definedEntries([
       ["store_path", storePath],
@@ -137,9 +161,11 @@ export class LocalRagBridge {
       process.env.PRISONBREAK_PYTHON ??
       (process.platform === "win32" ? "python" : "python3");
     const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const serialized = JSON.stringify(request);
+    if (Buffer.byteLength(serialized) > MAX_REQUEST_BYTES) return Promise.reject(new Error("Local RAG request exceeds byte limit"));
 
     return new Promise<T>((resolve, reject) => {
-      const child = spawn(pythonExecutable, ["-m", "server.rag.worker"], {
+      const child = this.spawnWorker(pythonExecutable, ["-m", "server.rag.worker"], {
         cwd: repoRoot,
         env: process.env,
         windowsHide: true,
@@ -148,7 +174,10 @@ export class LocalRagBridge {
 
       let stdout = "";
       let stderr = "";
+      let outputBytes = 0;
+      let diagnosticBytes = 0;
       let settled = false;
+      let failure: Error | undefined;
 
       const finish = (callback: () => void): void => {
         if (settled) return;
@@ -157,36 +186,49 @@ export class LocalRagBridge {
         callback();
       };
 
+      const failAfterClose = (error: Error): void => {
+        if (settled || failure) return;
+        failure = error;
+        clearTimeout(timer);
+        // A kill request is not process exit. Keep the serial queue (and the
+        // caller's case-operation lease) occupied until the worker closes, so
+        // it cannot overlap the next Qdrant reader/writer while shutting down.
+        child.kill("SIGKILL");
+      };
+
       const timer = setTimeout(() => {
-        child.kill();
-        finish(() =>
-          reject(
+        failAfterClose(
             new Error(
               `Local RAG worker timed out after ${timeoutMs}ms (${request.action})`
             )
-          )
         );
       }, timeoutMs);
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", chunk => {
+        if (failure) return;
+        outputBytes += Buffer.byteLength(chunk);
+        if (outputBytes > MAX_RESPONSE_BYTES) {
+          failAfterClose(new Error("Local RAG response exceeds byte limit")); return;
+        }
         stdout += chunk;
       });
       child.stderr.on("data", chunk => {
-        stderr += chunk;
+        if (failure) return;
+        diagnosticBytes += Buffer.byteLength(chunk);
+        if (diagnosticBytes <= MAX_DIAGNOSTIC_BYTES) stderr += chunk;
       });
       child.on("error", error => {
-        finish(() =>
-          reject(
+        failAfterClose(
             new Error(
               `Unable to start local RAG worker with ${pythonExecutable}: ${error.message}`
             )
-          )
         );
       });
       child.on("close", code => {
         finish(() => {
+          if (failure) { reject(failure); return; }
           const diagnostic = stderr.trim();
           if (code !== 0) {
             reject(
@@ -230,7 +272,10 @@ export class LocalRagBridge {
         });
       });
 
-      child.stdin.end(JSON.stringify(request));
+      child.stdin.on("error", error => {
+        failAfterClose(new Error(`Local RAG input failed: ${error.message}`));
+      });
+      child.stdin.end(serialized);
     });
   }
 }
@@ -240,6 +285,9 @@ export const localRag = new LocalRagBridge();
 
 export type {
   RagBridgeOptions,
+  RagDeleteCaseInput,
+  RagDeleteCorpusInput,
+  RagDeleteScopeResult,
   RagCitation,
   RagDeleteSourceInput,
   RagDeleteSourceResult,

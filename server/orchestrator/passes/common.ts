@@ -20,7 +20,7 @@ import { buildToolDefs, runTool } from "../tools";
 import type { LLMProvider } from "../providers";
 import type { ProviderMessage, ResponseSchema } from "../providers/types";
 import type { PassId, TrialStageEvent } from "../types";
-import { parseToolEvidence, type GroundedCitationValue } from "../grounding";
+import { citationMap, type GroundedCitationValue } from "../grounding";
 
 const MAX_ITERATIONS = 14;
 /** Final-pass output ceiling. Defender/prosecutor JSON for a mid-sized
@@ -28,7 +28,6 @@ const MAX_ITERATIONS = 14;
  *  unterminated JSON that JSON.parse rejects. 8192 leaves slack. */
 const PASS_MAX_TOKENS = 8192;
 const PERSONAS_DIR = path.join(process.cwd(), "server", "orchestrator", "personas");
-const DEBUG_DIR = path.join(process.cwd(), "data", "orchestrator-debug");
 
 export function loadPersona(name: string): string {
   return fs.readFileSync(path.join(PERSONAS_DIR, `${name}.md`), "utf-8");
@@ -105,8 +104,9 @@ export async function runPass(opts: PassRunOptions): Promise<PassRunResult> {
         target: petalKey,
       });
 
-      const output = await runTool(call.toolName, call.input, { caseId: opts.caseId });
-      for (const citation of parseToolEvidence(output)) {
+      const result = await runTool(call.toolName, call.input, { caseId: opts.caseId });
+      const output = result.output;
+      for (const citation of citationMap([...evidence.values(), ...result.evidence]).values()) {
         evidence.set(citation.citationId, citation);
       }
 
@@ -141,9 +141,7 @@ export async function runPass(opts: PassRunOptions): Promise<PassRunResult> {
  *   2. JSON.parse to get a value.
  *   3. Zod-validate against the pass's schema if one is provided.
  *
- * On failure: dump the full text + error to data/orchestrator-debug/
- * so we can diagnose without having to re-run the orchestrator. Throws
- * with the dump path included.
+ * On failure, retain no raw case/model-output diagnostics on disk.
  */
 export function parsePassJson<T>(
   text: string,
@@ -200,26 +198,9 @@ function makeBadOutputError(
   stage: string,
   detail: string,
 ): Error {
-  let dumpPath: string | null = null;
-  try {
-    if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    dumpPath = path.join(DEBUG_DIR, `${stamp}-${label}-bad.txt`);
-    fs.writeFileSync(
-      dumpPath,
-      `# Pass: ${label}\n` +
-        `# Stage: ${stage}\n` +
-        `# Detail: ${detail}\n` +
-        `# Raw output (${rawText.length} chars, sliced to ${slicedText.length}):\n\n` +
-        rawText,
-      "utf8",
-    );
-  } catch {
-    // best-effort — don't mask the real error
-  }
+  // Parser exception details can quote the private model output. Do not put
+  // them in logs, error events, or persisted debug files.
   return new Error(
-    `${label} pass output rejected at ${stage} (${slicedText.length} chars). ` +
-      `${detail}. ` +
-      `${dumpPath ? `Dump: ${dumpPath}` : ""}`,
+    `${label} pass output rejected at ${stage} (${slicedText.length} chars). No raw output was retained.`,
   );
 }

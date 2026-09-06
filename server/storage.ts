@@ -6,11 +6,14 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { atomicWriteFile } from "./persistence";
+import { getDataRoot } from "./runtimePaths";
 
-const UPLOAD_ROOT = path.join(process.cwd(), "data", "uploads");
+const uploadRoot = () => path.join(getDataRoot(), "uploads");
 const PUBLIC_URL_PREFIX = "/api/files";
 
 function ensureUploadRoot(): void {
+  const UPLOAD_ROOT = uploadRoot();
   if (!fs.existsSync(UPLOAD_ROOT)) {
     fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
   }
@@ -19,14 +22,25 @@ function ensureUploadRoot(): void {
 function normalizeKey(relKey: string): string {
   // Trim leading slashes, normalize separators, block parent traversal.
   const trimmed = relKey.replace(/^[/\\]+/, "").replace(/\\/g, "/");
-  if (trimmed.split("/").some(seg => seg === "..")) {
+  if (!trimmed || trimmed.split("/").some(seg => !seg || seg === ".." || seg === "." || /[\x00-\x1f:]/.test(seg))) {
     throw new Error(`Refusing storage key containing '..': ${relKey}`);
   }
   return trimmed;
 }
 
 function resolveLocalPath(key: string): string {
-  return path.join(UPLOAD_ROOT, key);
+  const root = uploadRoot();
+  const target = path.resolve(root, key);
+  if (!target.startsWith(root + path.sep)) throw new Error("Storage key escapes upload root");
+  // Existing symlinked ancestors may not redirect writes or downloads elsewhere.
+  if (fs.existsSync(root)) {
+    let ancestor = target;
+    while (!fs.existsSync(ancestor)) ancestor = path.dirname(ancestor);
+    const canonicalRoot = fs.realpathSync.native(root);
+    const canonicalAncestor = fs.realpathSync.native(ancestor);
+    if (canonicalAncestor !== canonicalRoot && !canonicalAncestor.startsWith(canonicalRoot + path.sep)) throw new Error("Storage path escapes upload root");
+  }
+  return target;
 }
 
 function buildPublicUrl(key: string): string {
@@ -51,7 +65,7 @@ export async function storagePut(
         ? data
         : Buffer.from(data);
 
-  fs.writeFileSync(localPath, buffer);
+  atomicWriteFile(localPath, buffer);
 
   return { key, url: buildPublicUrl(key) };
 }
@@ -68,4 +82,10 @@ export function resolveStoragePath(relKey: string): string {
   return resolveLocalPath(normalizeKey(relKey));
 }
 
-export const STORAGE_ROOT = UPLOAD_ROOT;
+export const STORAGE_ROOT = uploadRoot();
+
+/** Roll back only the unique upload created by the current failed request. */
+export function storageRemove(relKey: string): void {
+  const file = resolveStoragePath(relKey);
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+}

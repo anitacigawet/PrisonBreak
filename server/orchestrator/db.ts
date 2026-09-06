@@ -28,10 +28,7 @@ export async function getTrialResult(caseId: number): Promise<TrialResult | null
 export async function upsertTrialResult(result: TrialResult): Promise<void> {
   const db = getDb();
   // SQLite UPSERT via INSERT ... ON CONFLICT (cleaner than select-then-insert).
-  // Note: leaves `handoff` untouched on update — handoff regen is a
-  // separate user action; re-running Take-to-Trial does not invalidate
-  // the existing handoff. (The user can regenerate the handoff manually
-  // if the verdict changes meaningfully.)
+  // A handoff belongs to one exact trial result, never its replacement.
   await db
     .insert(trialResults)
     .values({
@@ -44,6 +41,7 @@ export async function upsertTrialResult(result: TrialResult): Promise<void> {
       set: {
         result: JSON.stringify(result),
         completedAt: new Date(),
+        handoff: null,
       },
     });
 }

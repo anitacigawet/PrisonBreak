@@ -28,8 +28,10 @@ export type TrialState =
 export function useTrialSocket(caseId: number | null) {
   const [state, setState] = useState<TrialState>({ kind: "idle" });
   const socketRef = useRef<Socket | null>(null);
+  const startedAt = useRef(0);
 
   useEffect(() => {
+    setState({ kind: "idle" });
     if (!caseId) return;
     const socket = io({ path: "/api/socket.io", transports: ["websocket", "polling"] });
     socketRef.current = socket;
@@ -40,6 +42,7 @@ export function useTrialSocket(caseId: number | null) {
         const stream =
           prev.kind === "idle" ? [] : [...prev.stream, event];
         if (event.kind === "start") {
+          startedAt.current = Date.now();
           return { kind: "running", stream: [event] };
         }
         if (event.kind === "complete") {
@@ -61,6 +64,22 @@ export function useTrialSocket(caseId: number | null) {
 
   /** Reset to idle — call before re-running. */
   const reset = useCallback(() => setState({ kind: "idle" }), []);
+  const markRunning = useCallback(() => {
+    setState(prev => {
+      if (prev.kind === "running") return prev;
+      startedAt.current = Date.now();
+      return { kind: "running", stream: [] };
+    });
+  }, []);
+  const reconcile = useCallback((result: { verdict: unknown; completedAt: string } | null) => {
+    setState(prev => {
+      if (prev.kind !== "running") return prev;
+      if (result && Date.parse(result.completedAt) >= startedAt.current) {
+        return { kind: "complete", stream: prev.stream, verdict: result.verdict };
+      }
+      return { kind: "error", stream: prev.stream, message: "The trial run ended without a new saved result. Retry Take-to-Trial." };
+    });
+  }, []);
 
-  return { state, reset };
+  return { state, reset, markRunning, reconcile };
 }

@@ -6,7 +6,9 @@ import { TRPCError } from "@trpc/server";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import * as db from "./db";
-import { storagePut } from "./storage";
+import { storagePut, storageRemove } from "./storage";
+import { withCaseOperation } from "./caseOperations";
+import { deleteCaseWithCleanup } from "./caseDeletion";
 import { extractCaseFactsFromIndex } from "./caseAnalysis";
 import { localRag } from "./rag/bridge";
 import { nanoid } from "nanoid";
@@ -96,12 +98,12 @@ export const appRouter = router({
           throw new TRPCError({ code: 'FORBIDDEN', message: 'You do not have permission to edit this case' });
         }
 
-        await db.updateCase(input.id, {
+        await withCaseOperation(input.id, "edit", () => db.updateCase(input.id, {
           title: input.title,
           caseNumber: input.caseNumber,
           jurisdiction: input.jurisdiction,
           charges: input.charges,
-        });
+        }));
         return { success: true };
       }),
 
@@ -117,45 +119,19 @@ export const appRouter = router({
           throw new TRPCError({ code: 'FORBIDDEN', message: 'You do not have permission to delete this case' });
         }
 
-        const localIndexCleanupErrors: string[] = [];
-        const documents = await db.getDocumentsByCaseId(input.id);
-        const researchSources = await db.listResearchSources(input.id);
-        try {
-          await localRag.health();
-          for (const document of documents) {
-            await localRag.deleteSource({
-              caseId: input.id,
-              corpus: "case",
-              sourceId: `document:${document.id}`,
-            });
-          }
-          for (const source of researchSources) {
-            await localRag.deleteSource({
-              caseId: input.id,
-              corpus: source.corpusKey,
-              sourceId: `research:${source.id}`,
-            });
-          }
-        } catch (error) {
-          localIndexCleanupErrors.push((error as Error).message);
-        }
-
-        await db.deleteCase(input.id);
-        return {
-          success: true,
-          localIndexCleanupErrors,
-        };
+        return deleteCaseWithCleanup(input.id, () => localRag.deleteCase({ caseId: input.id }));
       }),
 
     // Index uploaded documents locally, retrieve an evidence pack, and
     // populate a citation-checked fact sheet for research + comparison.
     analyzeFacts: protectedProcedure
       .input(z.object({ caseId: z.number() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input }) => withCaseOperation(input.caseId, "analyze", async () => {
         const caseRow = await db.getCaseById(input.caseId);
         if (!caseRow) {
           throw new TRPCError({ code: "NOT_FOUND", message: "Case not found" });
         }
+        await db.invalidateCaseAnalysis(input.caseId);
         await db.updateCaseStatus(input.caseId, "analyzing");
         try {
           const result = await extractCaseFactsFromIndex(input.caseId);
@@ -169,7 +145,7 @@ export const appRouter = router({
             message: (error as Error).message,
           });
         }
-      }),
+      })),
 
     // ── Take-to-Trial orchestrator (Phase 2) ───────────────────────────
     // Three-persona dialectical synthesis (prosecutor / defender /
@@ -197,7 +173,10 @@ export const appRouter = router({
           mimeType: z.string().optional(),
         })
       )
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input }) => withCaseOperation(input.caseId, "upload", async () => {
+        if (!input.fileName || /[\\/\x00-\x1f:]/.test(input.fileName) || input.fileName === "." || input.fileName === "..") {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Use a plain file name without path separators." });
+        }
         // Decode base64 file data. The frontend sends a data URL
         // (`data:<mime>;base64,<payload>`) via FileReader.readAsDataURL —
         // strip the prefix before decoding, otherwise the prefix bytes
@@ -230,7 +209,8 @@ export const appRouter = router({
         const { url } = await storagePut(fileKey, fileBuffer, input.mimeType);
 
         // Save to database
-        const result = await db.addDocument(
+        let result: Awaited<ReturnType<typeof db.addDocument>>;
+        try { result = await db.addDocument(
           input.caseId,
           input.fileName,
           fileKey,
@@ -239,14 +219,14 @@ export const appRouter = router({
           input.mimeType,
           fileSize
         );
-        await db.invalidateCaseAnalysis(input.caseId);
+        } catch (error) { storageRemove(fileKey); throw error; }
 
         return {
           success: true,
           documentId: Number(result[0].insertId),
           fileUrl: url,
         };
-      }),
+      })),
 
     checkDuplicate: protectedProcedure
       .input(
@@ -290,21 +270,25 @@ export const appRouter = router({
           throw new TRPCError({ code: 'FORBIDDEN', message: 'You do not have permission to add notes to this case' });
         }
 
-        const result = await db.createCaseNote(input.caseId, ctx.user.id, input.content);
+        const result = await withCaseOperation(input.caseId, "edit note", () => db.createCaseNote(input.caseId, ctx.user.id, input.content));
         return { noteId: Number(result[0].insertId) };
       }),
 
     update: protectedProcedure
       .input(z.object({ noteId: z.number(), content: z.string() }))
       .mutation(async ({ input }) => {
-        await db.updateCaseNote(input.noteId, input.content);
+        const note = await db.getCaseNoteById(input.noteId);
+        if (!note) throw new TRPCError({ code: "NOT_FOUND", message: "Note not found" });
+        await withCaseOperation(note.caseId, "edit note", () => db.updateCaseNote(input.noteId, input.content));
         return { success: true };
       }),
 
     delete: protectedProcedure
       .input(z.object({ noteId: z.number() }))
       .mutation(async ({ input }) => {
-        await db.deleteCaseNote(input.noteId);
+        const note = await db.getCaseNoteById(input.noteId);
+        if (!note) throw new TRPCError({ code: "NOT_FOUND", message: "Note not found" });
+        await withCaseOperation(note.caseId, "delete note", () => db.deleteCaseNote(input.noteId));
         return { success: true };
       }),
   }),

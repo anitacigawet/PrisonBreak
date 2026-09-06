@@ -2,44 +2,23 @@
 import { listPetalsForCase } from "../petals/db";
 import { localRag, type RagCitation } from "../rag/bridge";
 import type { DefenderHandoff, HandoffQuestion } from "./types";
+import { allQuotesMatch, extractQuotedPassages } from "./quotations";
 
-function normalize(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[‘’‚‛`´]/g, "'")
-    .replace(/[“”„‟«»]/g, '"')
-    .replace(/[–—−]/g, "-")
-    .replace(/[   ]/g, " ")
-    .replace(/[*_`]+/g, "")
-    .replace(/^#+\s*/gm, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractQuotedPassages(value: string): string[] {
-  const passages: string[] = [];
-  for (const pattern of [/"([^"]{8,})"/g, /[“]([^”]{8,})[”]/g, /[«]([^»]{8,})[»]/g]) {
-    for (const match of Array.from(value.matchAll(pattern))) {
-      if (match[1]) passages.push(match[1]);
-    }
-  }
-  return passages.sort((left, right) => right.length - left.length);
-}
-
-function verifiedQuestion(
+export function checkedQuestion(
   question: HandoffQuestion,
-  citation: RagCitation,
+  citation?: RagCitation,
 ): HandoffQuestion {
-  const metadata = citation.metadata as Record<string, unknown>;
-  return {
-    ...question,
-    citationId: citation.citationId,
-    sourceLabel: citation.sourceLabel,
-    locator: citation.locator,
-    sourceUrl: typeof metadata.canonicalUrl === "string" ? metadata.canonicalUrl : null,
-    verified: true,
-    verificationNote: undefined,
-  };
+  const canonicalUrl = citation && typeof citation.metadata.canonicalUrl === "string"
+    ? citation.metadata.canonicalUrl : null;
+  if (citation && citation.citationId === question.citationId &&
+      citation.sourceLabel === question.sourceLabel && citation.locator === question.locator &&
+      canonicalUrl === question.sourceUrl && allQuotesMatch(question.whyAsking, citation.passage)) {
+    return { ...question, sourceLabel: citation.sourceLabel, locator: citation.locator,
+      sourceUrl: canonicalUrl, verified: true, verificationNote: undefined };
+  }
+  // Never preserve a model-supplied clickable URL after verification fails.
+  return { ...question, sourceUrl: null, verified: false,
+    verificationNote: "Not every quoted passage matched the current retained citation. Check the source before relying on this question." };
 }
 
 async function verifyQuestion(
@@ -48,35 +27,16 @@ async function verifyQuestion(
   corpora: string[],
 ): Promise<HandoffQuestion> {
   const quotes = extractQuotedPassages(question.whyAsking);
-  if (quotes.length === 0) {
-    return {
-      ...question,
-      verified: false,
-      verificationNote:
-        "No quoted passage was found. Open the cited source before relying on this question.",
-    };
-  }
 
   for (const quote of quotes) {
     for (const corpus of corpora) {
       const result = await localRag.query({ caseId, corpus, query: quote, limit: 12 });
       const citation = result.matches.find(match => match.citationId === question.citationId);
-      if (
-        citation &&
-        normalize(citation.passage).includes(normalize(quote)) &&
-        citation.sourceLabel === question.sourceLabel
-      ) {
-        return verifiedQuestion(question, citation);
-      }
+      if (citation) return checkedQuestion(question, citation);
     }
   }
 
-  return {
-    ...question,
-    verified: false,
-    verificationNote:
-      "The quoted passage did not match the retained citation. Open the source directly before relying on it.",
-  };
+  return checkedQuestion(question);
 }
 
 export async function verifyHandoffCitations(

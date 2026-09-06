@@ -9,6 +9,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
+import { replacePetalSnapshot } from "@/pages/case-detail/workflowState";
 
 export type PetalStatus = "pending" | "building" | "completed" | "failed" | "skipped";
 
@@ -32,19 +33,25 @@ export interface PetalsCompletePayload {
   failed: number;
 }
 
-export function usePetalsSocket(caseId: number | null) {
+export function usePetalsSocket(caseId: number | null, refreshPersistedWorkflow?: () => void) {
   const [progressByKey, setProgressByKey] = useState<Record<string, PetalProgressPayload>>({});
   const [isGrowing, setIsGrowing] = useState(false);
   const [completion, setCompletion] = useState<PetalsCompletePayload | null>(null);
   const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
+    setProgressByKey({});
+    setIsGrowing(false);
+    setCompletion(null);
     if (!caseId) return;
 
     const socket = io({ path: "/api/socket.io", transports: ["websocket", "polling"] });
     socketRef.current = socket;
 
-    socket.on("connect", () => socket.emit("join-case", caseId));
+    socket.on("connect", () => {
+      socket.emit("join-case", caseId);
+      refreshPersistedWorkflow?.();
+    });
 
     socket.on("petals-started", () => {
       setIsGrowing(true);
@@ -58,6 +65,7 @@ export function usePetalsSocket(caseId: number | null) {
     socket.on("petals-complete", (data: PetalsCompletePayload) => {
       setIsGrowing(false);
       setCompletion(data);
+      refreshPersistedWorkflow?.();
     });
 
     return () => {
@@ -65,18 +73,18 @@ export function usePetalsSocket(caseId: number | null) {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [caseId]);
+  }, [caseId, refreshPersistedWorkflow]);
 
   /** Pre-populate the map from a REST list (run on first load). */
   const seedFromList = useCallback((rows: Array<Partial<PetalProgressPayload> & { petalKey?: string; key?: string }>) => {
-    setProgressByKey(prev => {
-      const next = { ...prev };
+    setProgressByKey(() => {
+      const next: PetalProgressPayload[] = [];
       for (const row of rows) {
         const key = (row as any).petalKey ?? row.key;
         if (!key) continue;
         // Map DB row shape -> progress payload shape if needed.
         const status = (row.status as PetalStatus) ?? "pending";
-        next[key] = {
+        next.push({
           key,
           label: row.label ?? key,
           description: row.description ?? "",
@@ -87,12 +95,13 @@ export function usePetalsSocket(caseId: number | null) {
           errorMessage: row.errorMessage ?? null,
           corpusKey: row.corpusKey ?? null,
           sourceCount: row.sourceCount ?? 0,
-        };
+        });
       }
-      return next;
+      return replacePetalSnapshot(next);
     });
     // If any row is in flight, treat as growing.
-    if (rows.some(r => r.status === "building")) setIsGrowing(true);
+    setIsGrowing(rows.some(r => r.status === "building"));
+    if (!rows.length) setCompletion(null);
   }, []);
 
   return { progressByKey, isGrowing, completion, seedFromList };

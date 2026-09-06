@@ -19,12 +19,27 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from xml.etree import ElementTree
+from xml.parsers import expat
 
 
 DEFAULT_COLLECTION = "prisonbreak_rag_v1"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 SCHEMA_VERSION = 1
 POINT_NAMESPACE = uuid.UUID("4c69eb75-9c27-4f71-90ac-9e8de7c39cd4")
+# Parser/embedding work budgets. These are input and expansion bounds, not a
+# claim that Python/native PDF libraries run under an OS memory sandbox.
+MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_XML_BYTES = 8 * 1024 * 1024
+MAX_ZIP_EXPANDED_BYTES = 32 * 1024 * 1024
+MAX_ZIP_ENTRIES = 2048
+MAX_ZIP_RATIO = 200
+MAX_XML_NODES = 100_000
+MAX_TEXT_CHARACTERS = 2_000_000
+MAX_BLOCKS = 10_000
+MAX_PDF_PAGES = 500
+MAX_PDF_EXPANDED_BYTES = 32 * 1024 * 1024
+MAX_CHUNKS = 5_000
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 
 class RagWorkerError(RuntimeError):
@@ -147,10 +162,27 @@ def _metadata(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_text(text: str) -> str:
+    _check_text(text)
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _check_text(text: str) -> None:
+    if len(text) > MAX_TEXT_CHARACTERS:
+        raise RagWorkerError(f"Extracted text exceeds {MAX_TEXT_CHARACTERS} characters")
+
+
+def _check_blocks(blocks: Sequence[ParsedBlock]) -> None:
+    if len(blocks) > MAX_BLOCKS:
+        raise RagWorkerError(f"Document exceeds {MAX_BLOCKS} text blocks")
+    total = 0
+    for block in blocks:
+        total += len(block.text)
+        if total > MAX_TEXT_CHARACTERS:
+            raise RagWorkerError(f"Extracted text exceeds {MAX_TEXT_CHARACTERS} characters")
+
+
 def _text_blocks(text: str, prefix: str = "text") -> list[ParsedBlock]:
+    _check_text(text)
     lines = text.splitlines()
     blocks: list[ParsedBlock] = []
     start: int | None = None
@@ -162,6 +194,8 @@ def _text_blocks(text: str, prefix: str = "text") -> list[ParsedBlock]:
             return
         normalized = _normalize_text("\n".join(parts))
         if normalized:
+            if len(blocks) >= MAX_BLOCKS:
+                raise RagWorkerError(f"Document exceeds {MAX_BLOCKS} text blocks")
             blocks.append(ParsedBlock(f"{prefix}:lines:{start}-{end_line}", normalized))
         start = None
         parts = []
@@ -192,6 +226,7 @@ class _BlockHtmlParser(HTMLParser):
         self._suppressed_depth = 0
         self._fallback_parts: list[str] = []
         self._ordinal = 0
+        self._text_length = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -217,6 +252,8 @@ class _BlockHtmlParser(HTMLParser):
             text = _normalize_text(" ".join(self._parts))
             if text:
                 self._ordinal += 1
+                if self._ordinal > MAX_BLOCKS:
+                    raise RagWorkerError(f"Document exceeds {MAX_BLOCKS} text blocks")
                 self.blocks.append(ParsedBlock(f"html:{tag}:{self._ordinal}", text))
             self._active_tag = None
             self._parts = []
@@ -225,6 +262,9 @@ class _BlockHtmlParser(HTMLParser):
         if self._suppressed_depth:
             return
         if data.strip():
+            self._text_length += len(data)
+            if self._text_length > MAX_TEXT_CHARACTERS:
+                raise RagWorkerError(f"Extracted text exceeds {MAX_TEXT_CHARACTERS} characters")
             self._fallback_parts.append(data)
             if self._active_tag:
                 self._parts.append(data)
@@ -235,19 +275,66 @@ class _BlockHtmlParser(HTMLParser):
 
 
 def _html_blocks(text: str) -> list[ParsedBlock]:
+    _check_text(text)
     parser = _BlockHtmlParser()
     parser.feed(text)
     parser.close()
     return parser.blocks or parser.fallback()
 
 
+def _validate_xml_budget(xml: bytes) -> None:
+    parser = expat.ParserCreate()
+    nodes = depth = characters = 0
+
+    def start(_name: str, _attrs: Any) -> None:
+        nonlocal nodes, depth
+        nodes += 1
+        depth += 1
+        if nodes > MAX_XML_NODES or depth > 128:
+            raise RagWorkerError("DOCX XML structure exceeds parser limits")
+
+    def end(_name: str) -> None:
+        nonlocal depth
+        depth -= 1
+
+    def data(text: str) -> None:
+        nonlocal characters
+        characters += len(text)
+        if characters > MAX_TEXT_CHARACTERS:
+            raise RagWorkerError(f"Extracted text exceeds {MAX_TEXT_CHARACTERS} characters")
+
+    def reject_dtd(*_args: Any) -> None:
+        raise RagWorkerError("DOCX XML must not contain a DTD or entity declarations")
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.CharacterDataHandler = data
+    parser.StartDoctypeDeclHandler = reject_dtd
+    parser.EntityDeclHandler = reject_dtd
+    parser.ExternalEntityRefHandler = reject_dtd
+    parser.Parse(xml, True)
+
+
 def _docx_blocks(path: Path) -> list[ParsedBlock]:
     try:
         with zipfile.ZipFile(path) as archive:
-            xml = archive.read("word/document.xml")
+            entries = archive.infolist()
+            if len(entries) > MAX_ZIP_ENTRIES or sum(entry.file_size for entry in entries) > MAX_ZIP_EXPANDED_BYTES:
+                raise RagWorkerError("DOCX archive exceeds expanded-size or entry limits")
+            document_entries = [entry for entry in entries if entry.filename == "word/document.xml"]
+            if len(document_entries) != 1:
+                raise RagWorkerError("DOCX must contain exactly one word/document.xml")
+            info = document_entries[0]
+            if info.file_size > MAX_XML_BYTES or info.file_size > max(1, info.compress_size) * MAX_ZIP_RATIO:
+                raise RagWorkerError("DOCX XML exceeds expanded-size or compression-ratio limits")
+            with archive.open(info) as stream:
+                xml = stream.read(MAX_XML_BYTES + 1)
+            if len(xml) > MAX_XML_BYTES:
+                raise RagWorkerError("DOCX XML exceeds expanded-size limit")
     except (KeyError, zipfile.BadZipFile) as exc:
         raise RagWorkerError(f"Invalid DOCX file: {path.name}") from exc
 
+    _validate_xml_budget(xml)
     root = ElementTree.fromstring(xml)
     namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     body = root.find(f".//{namespace}body")
@@ -271,33 +358,69 @@ def _docx_blocks(path: Path) -> list[ParsedBlock]:
                     if text:
                         locator = f"docx:table:{table_no}:row:{row_no}:cell:{cell_no}"
                         blocks.append(ParsedBlock(locator, text))
+        if len(blocks) > MAX_BLOCKS:
+            raise RagWorkerError(f"Document exceeds {MAX_BLOCKS} text blocks")
+    _check_blocks(blocks)
     return blocks
 
 
 def _pdf_blocks(path: Path) -> list[ParsedBlock]:
     try:
-        from pypdf import PdfReader
+        from pypdf import PdfReader, filters
     except ImportError as exc:
         raise RagWorkerError(
             "PDF parsing requires pypdf; install server/rag/requirements.txt"
         ) from exc
 
+    original_decoder = filters.decode_stream_data
+    expanded_bytes = 0
+
+    def bounded_decoder(stream: Any) -> bytes:
+        nonlocal expanded_bytes
+        data = original_decoder(stream)
+        expanded_bytes += len(data)
+        if expanded_bytes > MAX_PDF_EXPANDED_BYTES:
+            raise RagWorkerError("PDF exceeds aggregate decoded-stream byte limit")
+        return data
+
     try:
-        reader = PdfReader(str(path))
+        # Require bounded decoders rather than silently running older unbounded
+        # pypdf implementations. Native parsing still has no OS memory ceiling.
+        for setting in ("ZLIB_MAX_OUTPUT_LENGTH", "LZW_MAX_OUTPUT_LENGTH", "RUN_LENGTH_MAX_OUTPUT_LENGTH", "JBIG2_MAX_OUTPUT_LENGTH"):
+            if not hasattr(filters, setting):
+                raise RagWorkerError("PDF parsing requires bounded decoders; install server/rag/requirements.txt")
+            setattr(filters, setting, MAX_XML_BYTES)
+        # get_data imports this decoder at call time. Budget all decoded streams
+        # before pypdf retains them, including fonts and repeated page content.
+        filters.decode_stream_data = bounded_decoder
+        reader = PdfReader(str(path), strict=True)
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise RagWorkerError(f"PDF exceeds {MAX_PDF_PAGES} pages")
         blocks = []
+        text_length = 0
         for page_no, page in enumerate(reader.pages, start=1):
             text = _normalize_text(page.extract_text() or "")
+            text_length += len(text)
+            if text_length > MAX_TEXT_CHARACTERS:
+                raise RagWorkerError(f"Extracted text exceeds {MAX_TEXT_CHARACTERS} characters")
             if text:
                 blocks.append(ParsedBlock(f"pdf:page:{page_no}", text))
         return blocks
     except Exception as exc:
         raise RagWorkerError(f"Unable to parse PDF {path.name}: {exc}") from exc
+    finally:
+        filters.decode_stream_data = original_decoder
 
 
 def parse_document(path: Path, mime_type: str | None = None) -> tuple[bytes, list[ParsedBlock]]:
     if not path.is_file():
         raise RagWorkerError(f"Source file not found: {path}")
-    raw = path.read_bytes()
+    if path.stat().st_size > MAX_FILE_BYTES:
+        raise RagWorkerError(f"Source exceeds {MAX_FILE_BYTES} bytes")
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_FILE_BYTES + 1)
+    if len(raw) > MAX_FILE_BYTES:
+        raise RagWorkerError(f"Source exceeds {MAX_FILE_BYTES} bytes")
     suffix = path.suffix.lower()
     mime = (mime_type or "").split(";", 1)[0].strip().lower()
 
@@ -317,6 +440,7 @@ def parse_document(path: Path, mime_type: str | None = None) -> tuple[bytes, lis
 
     if not blocks:
         raise RagWorkerError(f"No extractable text found in {path.name}")
+    _check_blocks(blocks)
     return raw, blocks
 
 
@@ -328,11 +452,16 @@ def make_chunks(
     chunk_words: int,
     chunk_overlap: int,
 ) -> list[RagChunk]:
+    _check_blocks(blocks)
+    if not 4 <= chunk_words <= 2_000 or not 0 <= chunk_overlap < chunk_words:
+        raise RagWorkerError("Invalid chunk configuration")
     chunks: list[RagChunk] = []
     for block in blocks:
         words = block.text.split()
         start = 0
         while start < len(words):
+            if len(chunks) >= MAX_CHUNKS:
+                raise RagWorkerError(f"Source exceeds {MAX_CHUNKS} chunks")
             end = min(start + chunk_words, len(words))
             passage = " ".join(words[start:end])
             locator = f"{block.locator};words:{start + 1}-{end}"
@@ -441,21 +570,21 @@ class QdrantLocalStore:
             raise RagWorkerError(f"Unable to open Qdrant local store: {exc}") from exc
 
     def is_ready(self) -> bool:
-        try:
-            return bool(self.client.collection_exists(self.config.collection_name))
-        except Exception:
-            return False
+        # Storage errors must fail deletion/retrieval, not masquerade as an
+        # empty collection and let case deletion report a false success.
+        return bool(self.client.collection_exists(self.config.collection_name))
 
     def _filter(
         self,
         case_id: str,
-        corpus: str,
+        corpus: str | None,
         source_ids: Sequence[str] | None = None,
     ) -> Any:
         must = [
             self.models.FieldCondition(key="case_id", match=self.models.MatchValue(value=case_id)),
-            self.models.FieldCondition(key="corpus", match=self.models.MatchValue(value=corpus)),
         ]
+        if corpus is not None:
+            must.append(self.models.FieldCondition(key="corpus", match=self.models.MatchValue(value=corpus)))
         if source_ids:
             must.append(
                 self.models.FieldCondition(
@@ -495,6 +624,19 @@ class QdrantLocalStore:
                 ),
                 wait=True,
             )
+        return count
+
+    def delete_scope(self, case_id: str, corpus: str | None = None) -> int:
+        if not self.is_ready():
+            return 0
+        scoped_filter = self._filter(case_id, corpus)
+        count = int(self.client.count(collection_name=self.config.collection_name, count_filter=scoped_filter, exact=True).count)
+        if count:
+            self.client.delete(collection_name=self.config.collection_name,
+                               points_selector=self.models.FilterSelector(filter=scoped_filter), wait=True)
+        remaining = int(self.client.count(collection_name=self.config.collection_name, count_filter=scoped_filter, exact=True).count)
+        if remaining:
+            raise RagWorkerError("Qdrant deletion did not remove every matching chunk")
         return count
 
     def upsert(self, rows: Sequence[tuple[str, list[float], dict[str, Any]]]) -> None:
@@ -639,12 +781,24 @@ def handle_request(request: Mapping[str, Any]) -> dict[str, Any]:
         return _upsert(request, config, raw_bytes=raw, blocks=blocks)
 
     if action == "upsert_text":
-        text = _required_string(request, "text", max_length=20_000_000)
+        text = _required_string(request, "text", max_length=MAX_TEXT_CHARACTERS)
         prefix = str(request.get("locator_prefix") or "text").strip() or "text"
         blocks = _text_blocks(text, prefix)
         if not blocks:
             raise RagWorkerError("Text source contains no extractable text")
         return _upsert(request, config, raw_bytes=text.encode("utf-8"), blocks=blocks)
+
+    if action in {"delete_case", "delete_corpus"}:
+        case_id = _required_string(request, "case_id", max_length=16)
+        if not re.fullmatch(r"[1-9][0-9]*", case_id) or int(case_id) > 9_007_199_254_740_991:
+            raise RagWorkerError("Deletion requires a positive integer case_id")
+        corpus = _required_string(request, "corpus", max_length=128) if action == "delete_corpus" else None
+        store = _make_store(config)
+        try:
+            deleted = store.delete_scope(case_id, corpus)
+        finally:
+            store.close()
+        return {"caseId": case_id, "corpus": corpus, "deletedChunks": deleted}
 
     if action == "delete_source":
         identity = _identity(request, require_label=False)
@@ -707,7 +861,9 @@ def handle_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+        if len(raw) > MAX_REQUEST_BYTES:
+            raise RagWorkerError(f"Request exceeds {MAX_REQUEST_BYTES} bytes")
         if not raw.strip():
             raise RagWorkerError("Expected one JSON request on stdin")
         request = json.loads(raw)

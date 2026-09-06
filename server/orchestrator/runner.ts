@@ -79,11 +79,8 @@ export async function takeToTrial(opts: TakeToTrialOptions): Promise<TrialResult
       model,
     };
 
-    emit({ kind: "complete", verdict });
     return result;
   } catch (err) {
-    const message = (err as Error).message ?? String(err);
-    emit({ kind: "error", message });
     throw err;
   }
 }
@@ -97,14 +94,18 @@ export async function takeToTrial(opts: TakeToTrialOptions): Promise<TrialResult
 export function startTakeToTrialInBackground(
   caseId: number,
   settings: OrchestratorSettings,
-  onComplete?: (result: TrialResult) => void | Promise<void>,
+  onComplete: (result: TrialResult) => void | Promise<void>,
+  release: () => void,
 ): void {
   void (async () => {
     try {
       const result = await takeToTrial({ caseId, settings });
-      if (onComplete) await onComplete(result);
-    } catch {
-      // Errors already emitted via socket; swallow here.
+      await onComplete(result);
+      emitTrialStage(caseId, { kind: "complete", verdict: result.verdict });
+    } catch (error) {
+      emitTrialStage(caseId, { kind: "error", message: error instanceof Error ? error.message : "Trial workflow failed." });
+    } finally {
+      release();
     }
   })();
 }

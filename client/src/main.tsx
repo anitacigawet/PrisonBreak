@@ -29,10 +29,18 @@ const trpcClient = trpc.createClient({
   ],
 });
 
-createRoot(document.getElementById("root")!).render(
+async function bootstrap() {
+  const response = await fetch("/api/session", { method: "POST", credentials: "same-origin" });
+  if (!response.ok) throw new Error("Unable to establish a local session. Open the exact local URL printed by the server.");
+  createRoot(document.getElementById("root")!).render(
   <trpc.Provider client={trpcClient} queryClient={queryClient}>
     <QueryClientProvider client={queryClient}>
       <App />
     </QueryClientProvider>
   </trpc.Provider>
 );
+}
+
+bootstrap().catch(error => {
+  document.getElementById("root")!.textContent = error instanceof Error ? error.message : "Local session failed";
+});

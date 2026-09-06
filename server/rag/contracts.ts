@@ -85,6 +85,10 @@ export interface RagDeleteSourceResult {
   deletedChunks: number;
 }
 
+export interface RagDeleteCaseInput { caseId: RagCaseId; }
+export interface RagDeleteCorpusInput extends RagDeleteCaseInput { corpus: string; }
+export interface RagDeleteScopeResult { caseId: string; corpus: string | null; deletedChunks: number; }
+
 export interface RagQueryInput {
   caseId: RagCaseId;
   corpus: string;

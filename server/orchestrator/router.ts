@@ -13,6 +13,7 @@ import { z } from "zod";
 import { publicProcedure, router } from "../_core/trpc";
 import { TRPCError } from "@trpc/server";
 import { getCaseById } from "../db";
+import { acquireCaseOperation, getActiveCaseOperation, withCaseOperation } from "../caseOperations";
 import { readSettings } from "../_core/settings";
 import { startTakeToTrialInBackground } from "./runner";
 import { getHandoff, getTrialResult, upsertHandoff, upsertTrialResult } from "./db";
@@ -22,14 +23,19 @@ import { verifyHandoffCitations } from "./verify";
 import type { OrchestratorSettings } from "./types";
 
 export const orchestratorRouter = router({
+  workflowStatus: publicProcedure
+    .input(z.object({ caseId: z.number().int().positive() }))
+    .query(({ input }) => getActiveCaseOperation(input.caseId)),
   takeToTrial: publicProcedure
     .input(z.object({ caseId: z.number() }))
     .mutation(async ({ input }) => {
+      const release = await acquireCaseOperation(input.caseId, "trial");
+      try {
       const caseRow = await getCaseById(input.caseId);
       if (!caseRow) {
         throw new TRPCError({ code: "NOT_FOUND", message: "Case not found" });
       }
-      if (!caseRow.caseFacts) {
+      if (!caseRow.caseFacts || caseRow.status !== "completed") {
         throw new TRPCError({
           code: "PRECONDITION_FAILED",
           message: "Case has not been analyzed yet — analyze first.",
@@ -65,9 +71,13 @@ export const orchestratorRouter = router({
       // Fire-and-forget; progress streams via WebSocket.
       startTakeToTrialInBackground(input.caseId, runtimeSettings, async (result) => {
         await upsertTrialResult(result);
-      });
+      }, release);
 
       return { started: true as const, caseId: input.caseId };
+      } catch (error) {
+        release();
+        throw error;
+      }
     }),
 
   getTrialResult: publicProcedure
@@ -87,7 +97,7 @@ export const orchestratorRouter = router({
    */
   generateHandoff: publicProcedure
     .input(z.object({ caseId: z.number() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input }) => withCaseOperation(input.caseId, "handoff", async () => {
       const trial = await getTrialResult(input.caseId);
       if (!trial) {
         throw new TRPCError({
@@ -147,7 +157,7 @@ export const orchestratorRouter = router({
 
       await upsertHandoff(input.caseId, handoff);
       return handoff;
-    }),
+    })),
 
   getHandoff: publicProcedure
     .input(z.object({ caseId: z.number() }))

@@ -6,6 +6,7 @@ import { getCaseById } from "../../db";
 import { listPetalsForCase } from "../../petals/db";
 import { localRag, type RagCitation } from "../../rag/bridge";
 import type { ProviderToolDef } from "../providers/types";
+import type { GroundedCitationValue } from "../grounding";
 
 const PETAL_DESCRIPTIONS: Record<string, string> = {
   laws: "official statutes and regulations",
@@ -71,28 +72,34 @@ export interface ToolContext {
   caseId: number;
 }
 
-function formatMatch(match: RagCitation): string {
-  const metadata = match.metadata as Record<string, unknown>;
-  const url =
-    typeof metadata.canonicalUrl === "string" ? `\nURL: ${metadata.canonicalUrl}` : "";
-  const publisher =
-    typeof metadata.publisher === "string" && metadata.publisher
-      ? `\nPublisher: ${metadata.publisher}`
-      : "";
-  return [
-    `[${match.citationId}]`,
-    `Source: ${match.sourceLabel}`,
-    `Locator: ${match.locator}`,
-    `Passage: ${match.passage}${publisher}${url}`,
-  ].join("\n");
+export interface ToolResult {
+  output: string;
+  evidence: GroundedCitationValue[];
+}
+
+function message(output: string): ToolResult {
+  return { output, evidence: [] };
+}
+
+export function evidenceResult(matches: RagCitation[]): ToolResult {
+  const evidence = matches.map(match => ({
+    citationId: match.citationId,
+    sourceLabel: match.sourceLabel,
+    locator: match.locator,
+    passage: match.passage,
+    sourceUrl: typeof match.metadata.canonicalUrl === "string" ? match.metadata.canonicalUrl : null,
+  }));
+  // Display encoding is not an authority parser. Newlines or delimiter-like
+  // metadata remain inside JSON strings; only these typed matches grant IDs.
+  return { output: JSON.stringify({ evidence }), evidence };
 }
 
 async function queryCorpus(
   caseId: number,
   corpus: string,
   question: string,
-): Promise<string> {
-  if (!question.trim()) return "ERROR: empty question.";
+): Promise<ToolResult> {
+  if (!question.trim()) return message("ERROR: empty question.");
   try {
     const result = await localRag.query({
       caseId,
@@ -101,11 +108,11 @@ async function queryCorpus(
       limit: 8,
     });
     if (result.matches.length === 0) {
-      return "NO MATCHES: the selected local corpus contains no passage responsive to this question.";
+      return message("NO MATCHES: the selected local corpus contains no passage responsive to this question.");
     }
-    return result.matches.map(formatMatch).join("\n\n---\n\n");
+    return evidenceResult(result.matches);
   } catch (error) {
-    return `ERROR querying local evidence: ${(error as Error).message}`;
+    return message(`ERROR querying local evidence: ${(error as Error).message}`);
   }
 }
 
@@ -113,11 +120,11 @@ export async function runTool(
   toolName: string,
   input: Record<string, unknown>,
   context: ToolContext,
-): Promise<string> {
+): Promise<ToolResult> {
   if (toolName === "queryCase") {
     const caseRow = await getCaseById(context.caseId);
     if (!caseRow?.ragIndexedAt) {
-      return "ERROR: the uploaded case documents have not been indexed. Run Analyze first.";
+      return message("ERROR: the uploaded case documents have not been indexed. Run Analyze first.");
     }
     return queryCorpus(context.caseId, "case", String(input.question ?? ""));
   }
@@ -125,9 +132,9 @@ export async function runTool(
     const petalKey = String(input.petalKey ?? "");
     const petals = await listPetalsForCase(context.caseId);
     const petal = petals.find(item => item.petalKey === petalKey);
-    if (!petal) return `ERROR: research domain "${petalKey}" was not found.`;
+    if (!petal) return message(`ERROR: research domain "${petalKey}" was not found.`);
     if (petal.status !== "completed" || !petal.corpusKey) {
-      return `ERROR: research domain "${petalKey}" is not available (status: ${petal.status}).`;
+      return message(`ERROR: research domain "${petalKey}" is not available (status: ${petal.status}).`);
     }
     return queryCorpus(
       context.caseId,

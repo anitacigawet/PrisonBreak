@@ -15,13 +15,13 @@ echo.
 
 where node >nul 2>nul
 if errorlevel 1 (
-  echo ERROR: Node.js 22 or newer is required.
+  echo ERROR: Node.js 22.12 or newer is required.
   goto :failed
 )
 
-for /f "tokens=1 delims=." %%V in ('node -p "process.versions.node"') do set "NODE_MAJOR=%%V"
-if %NODE_MAJOR% LSS 22 (
-  echo ERROR: Node.js 22 or newer is required. Found Node.js %NODE_MAJOR%.
+node scripts\check-node.cjs
+if errorlevel 1 (
+  echo ERROR: Node.js 22.12 or newer is required.
   goto :failed
 )
 
@@ -34,6 +34,13 @@ if errorlevel 1 (
     goto :failed
   )
   set "PNPM_COMMAND=corepack pnpm"
+)
+
+set "PNPM_MAJOR="
+for /f "tokens=1 delims=." %%V in ('%PNPM_COMMAND% --version 2^>nul') do set "PNPM_MAJOR=%%V"
+if not "%PNPM_MAJOR%"=="10" (
+  echo ERROR: pnpm 10 is required. Found pnpm major version %PNPM_MAJOR%.
+  goto :failed
 )
 
 if not exist ".venv-rag\Scripts\python.exe" (

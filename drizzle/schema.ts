@@ -56,6 +56,9 @@ export const cases = sqliteTable("cases", {
    * (Phase 1) and the orchestrator's cross-query plan (Phase 2).
    */
   caseFacts: text("caseFacts"),
+  /** Durable tombstone: failed deletion must remain visible and retryable. */
+  deletionState: text("deletionState", { enum: ["active", "deleting", "error"] }).notNull().default("active"),
+  deletionError: text("deletionError"),
   createdAt: integer("createdAt", { mode: "timestamp" })
     .notNull()
     .default(sql`(unixepoch())`),

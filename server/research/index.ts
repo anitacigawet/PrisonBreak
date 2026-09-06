@@ -7,7 +7,7 @@ import {
   ResearchExecutionError,
   ResearchOutputError,
 } from "./errors";
-import { buildProviderCommand, getProviderExecutable } from "./providers";
+import { assertResearchProviderIsolated, buildProviderCommand, getProviderExecutable } from "./providers";
 import { NodeCommandRunner } from "./runner";
 import { researchOutputSchema, validateResearchPayload } from "./schema";
 import {
@@ -36,6 +36,24 @@ export function resolveResearchProvider(
     );
   }
   return value as ResearchProvider;
+}
+
+/** Synchronous admission check; no subprocess, credential read, or network call. */
+export function validateResearchConfiguration(env: NodeJS.ProcessEnv = process.env): ResearchProvider {
+  const provider = resolveResearchProvider(env);
+  assertResearchProviderIsolated(provider);
+  return provider;
+}
+
+/** Pass OS discovery and the selected CLI's explicit authentication only. */
+export function researchCommandEnvironment(config: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const allowed = new Set([
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "LANG", "LC_ALL", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+  ]);
+  return Object.fromEntries(Object.entries(config).filter(([key, value]) =>
+    value !== undefined && allowed.has(key.toUpperCase())));
 }
 
 function normalizeRequest(
@@ -142,9 +160,9 @@ export async function runWebResearch(
 ): Promise<WebResearchResult> {
   const request = normalizeRequest(input);
   const configEnv = options.env ?? process.env;
-  const commandEnv = { ...process.env, ...configEnv };
+  const commandEnv = researchCommandEnvironment(configEnv);
 
-  const provider = resolveResearchProvider(configEnv);
+  const provider = validateResearchConfiguration(configEnv);
   const runner = options.runner ?? new NodeCommandRunner();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   if (

@@ -12,6 +12,8 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { atomicWriteFile } from "../persistence";
+import { getDataRoot } from "../runtimePaths";
 
 export interface OrchestratorSettings {
   provider: "anthropic" | "openai";
@@ -26,8 +28,7 @@ export interface AppSettings {
   orchestrator?: OrchestratorSettings;
 }
 
-const SETTINGS_DIR = path.join(process.cwd(), "data");
-const SETTINGS_PATH = path.join(SETTINGS_DIR, "settings.json");
+const settingsPath = () => path.join(getDataRoot(), "settings.json");
 
 const DEFAULTS: AppSettings = {
   orchestrator: {
@@ -37,16 +38,17 @@ const DEFAULTS: AppSettings = {
 };
 
 function ensureDir(): void {
+  const SETTINGS_DIR = getDataRoot();
   if (!fs.existsSync(SETTINGS_DIR)) {
     fs.mkdirSync(SETTINGS_DIR, { recursive: true });
   }
 }
 
 export function readSettings(): AppSettings {
+  const SETTINGS_PATH = settingsPath();
   try {
     if (!fs.existsSync(SETTINGS_PATH)) return structuredClone(DEFAULTS);
     const raw = fs.readFileSync(SETTINGS_PATH, "utf8");
-    if (!raw.trim()) return structuredClone(DEFAULTS);
     const parsed = JSON.parse(raw) as AppSettings;
     return {
       ...DEFAULTS,
@@ -57,22 +59,20 @@ export function readSettings(): AppSettings {
       },
     };
   } catch (err) {
-    console.warn("[Settings] Failed to read settings.json:", err);
-    return structuredClone(DEFAULTS);
+    throw new Error("Settings could not be read. Restore the local settings file before saving changes.");
   }
 }
 
-export function writeSettings(patch: Partial<AppSettings>): AppSettings {
+export function writeSettings(patch: { orchestrator?: Partial<OrchestratorSettings> }): AppSettings {
   ensureDir();
   const current = readSettings();
   const next: AppSettings = {
     ...current,
-    ...patch,
     orchestrator: patch.orchestrator
-      ? { ...current.orchestrator!, ...patch.orchestrator }
+      ? { ...current.orchestrator!, ...Object.fromEntries(Object.entries(patch.orchestrator).filter(([, value]) => value !== undefined)) }
       : current.orchestrator,
   };
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2), "utf8");
+  atomicWriteFile(settingsPath(), JSON.stringify(next, null, 2));
   return next;
 }
 

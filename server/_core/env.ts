@@ -5,9 +5,12 @@
  * from `PRISONBREAK_*` environment variables. Orchestration provider
  * keys remain in the local settings store configured through the UI.
  */
+import * as path from "node:path";
+import { getDataRoot } from "../runtimePaths";
+
 export const ENV = {
   isProduction: process.env.NODE_ENV === "production",
 
   /** SQLite database file location. */
-  databasePath: process.env.DATABASE_PATH ?? "./data/app.db",
+  databasePath: process.env.DATABASE_PATH ?? path.join(getDataRoot(), "app.db"),
 };

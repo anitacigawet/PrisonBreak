@@ -6,7 +6,7 @@
  * every analysis run; it'll create or reset as appropriate.
  */
 import { and, eq } from "drizzle-orm";
-import { getDb } from "../db";
+import { atomicDatabaseTransaction, getDb } from "../db";
 import {
   casePetals,
   type CasePetal,
@@ -36,9 +36,8 @@ export async function getPetal(
 }
 
 /**
- * Get-or-create a petal row. If one already exists for (caseId,
- * petalKey), it's reset to status='pending' and progress=0 so a
- * re-grow starts cleanly.
+ * Get-or-create without changing the active generation. Rebuild progress must
+ * never erase the last usable source set before its replacement is indexed.
  */
 export async function ensurePetalRow(
   caseId: number,
@@ -47,19 +46,6 @@ export async function ensurePetalRow(
   const db = getDb();
   const existing = await getPetal(caseId, petalKey);
   if (existing) {
-    await db
-      .update(casePetals)
-      .set({
-        status: "pending",
-        progress: 0,
-        summary: null,
-        reasonSkipped: null,
-        errorMessage: null,
-        startedAt: null,
-        completedAt: null,
-        updatedAt: new Date(),
-      })
-      .where(eq(casePetals.id, existing.id));
     return existing.id;
   }
   const inserted = await db
@@ -67,6 +53,23 @@ export async function ensurePetalRow(
     .values({ caseId, petalKey })
     .returning({ id: casePetals.id });
   return Number(inserted[0].id);
+}
+
+/** The only visibility switch: all staged vectors already exist before this
+ * transaction publishes their corpus key and invalidates derived trial work. */
+export function activatePetalGeneration(input: {
+  caseId: number; petalId: number; corpusKey: string; sourceCount: number; summary: string;
+}): void {
+  atomicDatabaseTransaction(sqlite => {
+    const now = Math.floor(Date.now() / 1000);
+    sqlite.run('UPDATE researchSources SET indexedAt = ? WHERE caseId = ? AND corpusKey = ?',
+      [now, input.caseId, input.corpusKey]);
+    sqlite.run(`UPDATE casePetals SET status = 'completed', progress = 100,
+      corpusKey = ?, sourceCount = ?, summary = ?, errorMessage = NULL,
+      reasonSkipped = NULL, completedAt = ?, updatedAt = ? WHERE id = ? AND caseId = ?`,
+      [input.corpusKey, input.sourceCount, input.summary, now, now, input.petalId, input.caseId]);
+    sqlite.run('DELETE FROM trialResults WHERE caseId = ?', [input.caseId]);
+  });
 }
 
 export interface PetalUpdate {

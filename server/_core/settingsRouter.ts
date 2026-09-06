@@ -35,22 +35,14 @@ export const settingsRouter = router({
         openaiApiKey?: string;
       } = {};
       if (input.provider) patch.provider = input.provider;
-      if (input.model) patch.model = input.model;
+      if (input.model !== undefined) patch.model = input.model;
       if (input.anthropicApiKey !== undefined) {
         patch.anthropicApiKey = input.anthropicApiKey;
       }
       if (input.openaiApiKey !== undefined) {
         patch.openaiApiKey = input.openaiApiKey;
       }
-      writeSettings({
-        orchestrator: {
-          // Defaults filled in by readSettings if any field is missing.
-          provider: patch.provider ?? "openai",
-          model: patch.model ?? "gpt-4.1-mini",
-          anthropicApiKey: patch.anthropicApiKey,
-          openaiApiKey: patch.openaiApiKey,
-        },
-      });
+      writeSettings({ orchestrator: patch });
       return { ok: true as const };
     }),
 });

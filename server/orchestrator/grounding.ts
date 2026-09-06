@@ -1,4 +1,6 @@
 /** Fail-closed citation propagation across analysis passes. */
+import type { DefenderHandoff } from "./types";
+import { allQuotesMatch } from "./quotations";
 export interface GroundedCitationValue {
   citationId: string;
   sourceLabel: string;
@@ -12,7 +14,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function collectGroundedCitations(value: unknown): GroundedCitationValue[] {
-  const found = new Map<string, GroundedCitationValue>();
+  // Retain every occurrence. Deduplicating before validation hides an altered
+  // copy when a later, valid copy has the same ID.
+  const found: GroundedCitationValue[] = [];
   const visit = (current: unknown): void => {
     if (Array.isArray(current)) {
       current.forEach(visit);
@@ -24,7 +28,7 @@ export function collectGroundedCitations(value: unknown): GroundedCitationValue[
       typeof current.sourceLabel === "string" &&
       typeof current.passage === "string"
     ) {
-      found.set(current.citationId, {
+      found.push({
         citationId: current.citationId,
         sourceLabel: current.sourceLabel,
         passage: current.passage,
@@ -35,7 +39,24 @@ export function collectGroundedCitations(value: unknown): GroundedCitationValue[
     Object.values(current).forEach(visit);
   };
   visit(value);
-  return Array.from(found.values());
+  return found;
+}
+
+export function citationMap(allowed: Iterable<GroundedCitationValue>): Map<string, GroundedCitationValue> {
+  const result = new Map<string, GroundedCitationValue>();
+  for (const item of allowed) {
+    const previous = result.get(item.citationId);
+    if (previous && !sameCitation(previous, item)) {
+      throw new Error(`Conflicting retained evidence for citation ${item.citationId}.`);
+    }
+    result.set(item.citationId, item);
+  }
+  return result;
+}
+
+function sameCitation(left: GroundedCitationValue, right: GroundedCitationValue): boolean {
+  return left.sourceLabel === right.sourceLabel && left.passage === right.passage &&
+    left.locator === right.locator && left.sourceUrl === right.sourceUrl;
 }
 
 export function assertGroundedCitations(
@@ -43,41 +64,33 @@ export function assertGroundedCitations(
   allowed: Iterable<GroundedCitationValue>,
   label: string,
 ): void {
-  const allowedMap = new Map(Array.from(allowed, item => [item.citationId, item]));
+  const allowedMap = citationMap(allowed);
   for (const citation of collectGroundedCitations(value)) {
     const canonical = allowedMap.get(citation.citationId);
     if (!canonical) {
       throw new Error(`${label} emitted citation ${citation.citationId} without retrieving it.`);
     }
-    if (
-      citation.sourceLabel !== canonical.sourceLabel ||
-      citation.passage !== canonical.passage ||
-      citation.locator !== canonical.locator ||
-      citation.sourceUrl !== canonical.sourceUrl
-    ) {
+    if (!sameCitation(citation, canonical)) {
       throw new Error(`${label} altered the server-owned fields for citation ${citation.citationId}.`);
     }
   }
 }
 
-export function parseToolEvidence(output: string): GroundedCitationValue[] {
-  const citations: GroundedCitationValue[] = [];
-  for (const block of output.split(/\n\n---\n\n/g)) {
-    const lines = block.split("\n");
-    const id = lines[0]?.match(/^\[([^\]]+)\]$/)?.[1];
-    const sourceLabel = lines.find(line => line.startsWith("Source: "))?.slice(8);
-    const locator = lines.find(line => line.startsWith("Locator: "))?.slice(9);
-    const passageLine = lines.findIndex(line => line.startsWith("Passage: "));
-    if (!id || !sourceLabel || !locator || passageLine < 0) continue;
-    const end = lines.findIndex(
-      (line, index) => index > passageLine && (line.startsWith("Publisher: ") || line.startsWith("URL: ")),
-    );
-    const passage = lines
-      .slice(passageLine, end === -1 ? lines.length : end)
-      .join("\n")
-      .slice("Passage: ".length);
-    const sourceUrl = lines.find(line => line.startsWith("URL: "))?.slice(5) ?? null;
-    citations.push({ citationId: id, sourceLabel, passage, locator, sourceUrl });
+/** Handoff questions have whyAsking rather than passage; validate explicitly. */
+export function assertHandoffCitations(
+  handoff: DefenderHandoff,
+  allowed: Iterable<GroundedCitationValue>,
+): void {
+  const retained = citationMap(allowed);
+  for (const question of handoff.questions) {
+    const canonical = retained.get(question.citationId);
+    if (!canonical) throw new Error("Handoff question cites evidence absent from the verdict.");
+    if (question.sourceLabel !== canonical.sourceLabel ||
+        question.locator !== canonical.locator || question.sourceUrl !== canonical.sourceUrl) {
+      throw new Error("Handoff question altered server-owned citation metadata.");
+    }
+    if (!allQuotesMatch(question.whyAsking, canonical.passage)) {
+      throw new Error("Every quoted handoff passage must match its retained citation.");
+    }
   }
-  return citations;
 }

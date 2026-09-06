@@ -14,6 +14,8 @@ interface PrebloomCardProps {
   onUpload: () => void;
   onAnalyze: () => void;
   onBeginGrow: () => void;
+  growPending?: boolean;
+  retryGrow?: boolean;
 }
 
 const ANALYZE_PHASES = [
@@ -24,7 +26,7 @@ const ANALYZE_PHASES = [
   "Validating proofs and citations…",
 ];
 
-export default function PrebloomCard({ phase, docs, onUpload, onAnalyze, onBeginGrow }: PrebloomCardProps) {
+export default function PrebloomCard({ phase, docs, onUpload, onAnalyze, onBeginGrow, growPending = false, retryGrow = false }: PrebloomCardProps) {
   return (
     <div
       className="animate-fade-in-up"
@@ -34,7 +36,7 @@ export default function PrebloomCard({ phase, docs, onUpload, onAnalyze, onBegin
         {phase === "upload" && <UploadStep onUpload={onUpload} />}
         {phase === "analyze" && <AnalyzeStep docs={docs} onAnalyze={onAnalyze} />}
         {phase === "analyzing" && <AnalyzingStep />}
-        {phase === "grow" && <BeginGrowStep onBeginGrow={onBeginGrow} />}
+        {phase === "grow" && <BeginGrowStep onBeginGrow={onBeginGrow} pending={growPending} retry={retryGrow} />}
       </div>
     </div>
   );
@@ -69,7 +71,7 @@ function UploadStep({ onUpload }: { onUpload: () => void }) {
             lineHeight: 1,
           }}
         >
-          Drop files or click to browse
+          Click to browse files
         </div>
         <div
           className="mono"
@@ -80,7 +82,7 @@ function UploadStep({ onUpload }: { onUpload: () => void }) {
             letterSpacing: "0.08em",
           }}
         >
-          pdf · docx · txt
+          pdf · docx · txt · markdown · html
         </div>
       </div>
     </>
@@ -145,11 +147,11 @@ function AnalyzingStep() {
   );
 }
 
-function BeginGrowStep({ onBeginGrow }: { onBeginGrow: () => void }) {
+function BeginGrowStep({ onBeginGrow, pending, retry }: { onBeginGrow: () => void; pending: boolean; retry: boolean }) {
   return (
     <div className="flex items-center justify-between gap-4">
       <div className="min-w-0">
-        <Step n={3} label="Begin growing" />
+        <Step n={3} label={retry ? "Retry research" : "Begin growing"} />
         <div
           className="mono"
           style={{
@@ -159,10 +161,10 @@ function BeginGrowStep({ onBeginGrow }: { onBeginGrow: () => void }) {
             letterSpacing: "0.08em",
           }}
         >
-          one source-grounded corpus per research domain · 8 in this case
+          {retry ? "Retries failed or incomplete domains; completed research is retained." : "one source-grounded corpus per research domain · 8 in this case"}
         </div>
       </div>
-      <InkButton onClick={onBeginGrow} label="🌱  Begin growing" />
+      <InkButton onClick={onBeginGrow} disabled={pending} label={pending ? "Starting…" : retry ? "Retry research" : "🌱  Begin growing"} />
     </div>
   );
 }

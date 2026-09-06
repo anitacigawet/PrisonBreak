@@ -5,6 +5,10 @@
   "description": "A self-hosted, source-grounded workspace for reading criminal case records and preparing questions for attorney review.",
   "type": "module",
   "license": "PolyForm-Noncommercial-1.0.0",
+  "engines": {
+    "node": ">=22.12.0",
+    "pnpm": ">=10 <11"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/anitacigawet/PrisonBreak.git"
@@ -16,7 +20,9 @@
     "dev": "cross-env NODE_ENV=development tsx watch server/_core/index.ts",
     "build": "vite build && esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "cross-env NODE_ENV=production node dist/index.js",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit --incremental false",
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test:runtime": "pnpm build && tsx --test tests/runtime.integration.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.95.2",
@@ -78,7 +84,9 @@
     ],
     "overrides": {
       "engine.io": "6.6.7",
+      "mysql2": "3.23.1",
       "path-to-regexp": "0.1.13",
+      "qs": "6.16.0",
       "socket.io-parser": "4.2.7",
       "ws": "8.21.3"
     }

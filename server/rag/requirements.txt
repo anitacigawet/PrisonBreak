@@ -8,4 +8,4 @@
 
 qdrant-client>=1.12,<2.0
 fastembed>=0.6,<1.0
-pypdf>=5.0,<7.0
+pypdf>=6.16.2,<7.0

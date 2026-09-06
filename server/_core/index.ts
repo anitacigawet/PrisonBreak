@@ -10,46 +10,58 @@ import { resolveStoragePath } from "../storage";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import { initializeWebSocket } from "./websocket";
+import { createLocalSecurity, uploadedFileHeaders } from "./localSecurity";
 
-function isPortAvailable(port: number): Promise<boolean> {
+function isPortAvailable(port: number, host: string): Promise<boolean> {
   return new Promise(resolve => {
     const server = net.createServer();
-    server.listen(port, () => {
+    server.listen(port, host, () => {
       server.close(() => resolve(true));
     });
     server.on("error", () => resolve(false));
   });
 }
 
-async function findAvailablePort(startPort: number = 3000): Promise<number> {
+async function findAvailablePort(startPort: number, host: string): Promise<number> {
   for (let port = startPort; port < startPort + 20; port++) {
-    if (await isPortAvailable(port)) return port;
+    if (port <= 65535 && await isPortAvailable(port, host)) return port;
   }
   throw new Error(`No available port found starting from ${startPort}`);
 }
 
 async function startServer() {
+  const preferredPort = Number(process.env.PORT || "3000");
+  if (!Number.isInteger(preferredPort) || preferredPort < 1 || preferredPort > 65535) throw new Error("PORT must be between 1 and 65535");
+  const host = process.env.HOST || "127.0.0.1";
+  if (!["127.0.0.1", "::1", "localhost"].includes(host)) throw new Error("PrisonBreak supports loopback HOST values only");
+  const port = await findAvailablePort(preferredPort, host);
   // DB must be initialized before any tRPC handler runs.
   await initDb();
 
   const app = express();
   const server = createServer(app);
 
-  initializeWebSocket(server);
+  const security = createLocalSecurity(port);
+  security.install(app);
+  server.prependListener("upgrade", (req, socket) => {
+    if (!security.validRequest(req) || !security.isAllowedOrigin(req.headers.origin)) socket.destroy();
+  });
+  initializeWebSocket(server, security);
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   // Serve uploaded case documents from the local storage directory.
   app.get("/api/files/*", (req, res) => {
-    const key = decodeURIComponent(req.path.replace(/^\/api\/files\//, ""));
     try {
+      const key = decodeURIComponent(req.path.replace(/^\/api\/files\//, ""));
       const fullPath = resolveStoragePath(key);
       if (!fs.existsSync(fullPath)) {
         res.status(404).json({ error: "File not found" });
         return;
       }
-      res.sendFile(fullPath);
+      res.set(uploadedFileHeaders);
+      res.download(fullPath);
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
@@ -69,16 +81,12 @@ async function startServer() {
     serveStatic(app);
   }
 
-  const preferredPort = parseInt(process.env.PORT || "3000");
-  const host = process.env.HOST || "127.0.0.1";
-  const port = await findAvailablePort(preferredPort);
-
   if (port !== preferredPort) {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
   }
 
   server.listen(port, host, () => {
-    console.log(`Server running on http://${host}:${port}/`);
+    console.log(`Server running on http://${host === "::1" ? "[::1]" : host}:${port}/`);
   });
 }
 

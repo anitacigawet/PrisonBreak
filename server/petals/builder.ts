@@ -6,14 +6,16 @@
  *  4. persist the source ledger and a short research summary.
  */
 import type { Case } from "../../drizzle/schema";
+import { randomUUID } from "node:crypto";
 import { parseCaseFacts } from "../../shared/caseFacts";
 import { emitPetalProgress } from "../_core/websocket";
 import * as appDb from "../db";
 import { localRag } from "../rag/bridge";
 import { runWebResearch } from "../research";
 import { fetchAndSnapshotSource } from "../sources/fetch";
-import { ensurePetalRow, updatePetal } from "./db";
+import { activatePetalGeneration, ensurePetalRow, getPetal, updatePetal } from "./db";
 import type { PetalSpec } from "./types";
+import { cleanInactiveGenerations, discardGeneration } from "./generations";
 
 function eventShape(
   spec: PetalSpec,
@@ -52,7 +54,13 @@ export async function buildPetal(
   errorMessage: string | null;
 }> {
   const petalId = await ensurePetalRow(caseRow.id, spec.key);
+  const previous = await getPetal(caseRow.id, spec.key);
   const facts = parseCaseFacts(caseRow.caseFacts);
+  // Every attempt gets a private staging corpus. Queries resolve only the
+  // active key on casePetals; failed staging never overwrites that key.
+  const corpusKey = `research:${spec.key}:${randomUUID()}`;
+  let published: { sourceCount: number; summary: string } | null = null;
+  try {
   const applicability = await spec.applicability(caseRow, facts);
 
   if (!applicability.apply) {
@@ -81,30 +89,17 @@ export async function buildPetal(
     };
   }
 
-  const corpusKey = `research:${spec.key}`;
   await updatePetal(petalId, {
     status: "building",
     progress: 5,
-    corpusKey,
-    sourceCount: 0,
     startedAt: new Date(),
     reasonSkipped: null,
     errorMessage: null,
   });
   emitPetalProgress(
     caseRow.id,
-    eventShape(spec, { status: "building", progress: 5, corpusKey }),
+    eventShape(spec, { status: "building", progress: 5, corpusKey: previous?.corpusKey }),
   );
-
-  try {
-    const previous = await appDb.listResearchSources(caseRow.id, corpusKey);
-    for (const source of previous) {
-      await localRag.deleteSource({
-        caseId: caseRow.id,
-        corpus: corpusKey,
-        sourceId: `research:${source.id}`,
-      });
-    }
 
     const query = spec.researchQuery(caseRow, facts);
     const research = await runWebResearch({
@@ -203,14 +198,18 @@ export async function buildPetal(
       .filter(Boolean)
       .join("\n\n");
 
-    await updatePetal(petalId, {
-      status: "completed",
-      progress: 100,
+    activatePetalGeneration({
+      caseId: caseRow.id,
+      petalId,
       corpusKey,
       sourceCount: ledgerRows.length,
       summary,
-      completedAt: new Date(),
     });
+    published = { sourceCount: ledgerRows.length, summary };
+    // Publication has committed. Inactive-generation cleanup must not turn a
+    // successful publication into a rollback to the previous corpus.
+    try { await cleanInactiveGenerations(caseRow.id, spec.key, corpusKey); }
+    catch { console.error("[Grow] Inactive research cleanup deferred until retry or case deletion."); }
     emitPetalProgress(
       caseRow.id,
       eventShape(spec, {
@@ -229,28 +228,41 @@ export async function buildPetal(
       errorMessage: null,
     };
   } catch (error) {
+    if (published) {
+      return { status: "completed", corpusKey, sourceCount: published.sourceCount, summary: published.summary, errorMessage: null };
+    }
     const errorMessage = error instanceof Error ? error.message : String(error);
+    try { await discardGeneration(caseRow.id, corpusKey); }
+    catch { console.error("[Grow] Partial research data retained for a later cleanup retry or case deletion."); }
+    // Keep both the active ledger and vectors on any discovery, fetch, index,
+    // or activation failure. Abandoned staging is invisible and remains
+    // case-scoped so retryable case deletion also removes partial generations.
+    const retained = !!previous?.corpusKey && previous.sourceCount > 0;
     await updatePetal(petalId, {
-      status: "failed",
-      progress: 0,
-      sourceCount: 0,
+      status: retained ? "completed" : "failed",
+      progress: retained ? 100 : 0,
+      corpusKey: previous?.corpusKey ?? null,
+      sourceCount: previous?.sourceCount ?? 0,
+      summary: previous?.summary ?? null,
       errorMessage,
       completedAt: new Date(),
     });
     emitPetalProgress(
       caseRow.id,
       eventShape(spec, {
-        status: "failed",
-        progress: 0,
-        corpusKey,
+        status: retained ? "completed" : "failed",
+        progress: retained ? 100 : 0,
+        corpusKey: previous?.corpusKey ?? null,
+        sourceCount: previous?.sourceCount ?? 0,
+        summary: previous?.summary ?? null,
         errorMessage,
       }),
     );
     return {
       status: "failed",
-      corpusKey,
-      sourceCount: 0,
-      summary: null,
+      corpusKey: previous?.corpusKey ?? null,
+      sourceCount: previous?.sourceCount ?? 0,
+      summary: previous?.summary ?? null,
       errorMessage,
     };
   }

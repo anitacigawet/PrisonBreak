@@ -15,7 +15,7 @@ Uploaded case documents
                     │       └── Selected Anthropic or OpenAI API
                     │
                     └── Bounded research briefs
-                            └── Codex CLI or Claude CLI web search
+                            └── Claude CLI web search
                                     │
                                     └── Candidate official sources
                                             │
@@ -45,7 +45,7 @@ This step is not local-only: the selected API provider receives the retrieved pa
 
 ## Web research and source admission
 
-Grow creates bounded research briefs from structured case details such as jurisdiction, charges or statutes, court level, and relevant evidence types. A locally installed Codex CLI or Claude CLI performs live web research and returns candidate primary sources. The CLI is network-backed even though it is launched from the local application.
+Grow creates bounded research briefs from structured case details such as jurisdiction, charges or statutes, court level, and relevant evidence types. A locally installed Claude CLI performs live web research and returns candidate primary sources. The CLI is network-backed even though it is launched from the local application. Codex research is currently disabled; selecting it reports a configuration error rather than switching providers.
 
 CLI output is treated as discovery data, not as evidence. PrisonBreak independently validates and fetches each admitted URL, retains a hash-addressed snapshot under `data/research/`, records it in the source ledger, and indexes the snapshot into a case-scoped Qdrant research corpus. A source that cannot be fetched and retained is not admitted to grounded comparison.
 
@@ -57,6 +57,6 @@ The resulting Take-to-Trial view is a map of agreements, disagreements, and narr
 
 ## Storage and trust boundary
 
-The app uses `sql.js` with Drizzle and writes its database, uploads, Qdrant files, retained research snapshots, FastEmbed model cache, provider settings, and structured-output debug artifacts below `data/`. That directory is ignored by Git, but it is not encrypted by PrisonBreak.
+The app uses `sql.js` with Drizzle and writes its database, uploads, Qdrant files, retained research snapshots, FastEmbed model cache, and provider settings below `data/` by default. That directory is ignored by Git, but it is not encrypted by PrisonBreak. New runs do not save raw model-output debug artifacts; legacy captures from earlier builds are not automatically removed.
 
 The application is a single-user localhost tool, not a hardened network service. Research and analysis features contact external providers, so local storage must not be mistaken for local-only processing. See [SECURITY.md](../SECURITY.md) before using real material.

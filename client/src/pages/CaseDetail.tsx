@@ -43,12 +43,14 @@ import TakeToTrial from "./case-detail/TakeToTrial";
 import TakeToTrialPanel from "./case-detail/TakeToTrialPanel";
 import type { CasePhase, RightSection, CaseStatus } from "./case-detail/types";
 import { useTrialSocket } from "@/hooks/useTrialSocket";
+import { deriveCasePhase, refreshResearchOutputCaches } from "./case-detail/workflowState";
 
 export default function CaseDetail({ params }: { params: { id: string } }) {
   const { user, loading: authLoading } = useAuth();
   const { runTour, markTourComplete } = useOnboardingTour("case-detail");
   const [, navigate] = useLocation();
   const caseId = parseInt(params.id);
+  const utils = trpc.useUtils();
 
   // ───────────────────────────── State ─────────────────────────────────────
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
@@ -63,24 +65,45 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
    *  drawer is replaced by the TakeToTrialPanel (construction tape +
    *  thinking stream + verdict). "idle" shows the normal tab strip. */
   const [trialMode, setTrialMode] = useState<"idle" | "active">("idle");
-  const { state: trialState, reset: resetTrial } = useTrialSocket(caseId);
+  const { state: trialState, reset: resetTrial, markRunning: markTrialRunning, reconcile: reconcileTrial } = useTrialSocket(caseId);
 
   // ─────────────────────────── Queries / hooks ─────────────────────────────
-  const { data: caseData, isLoading: caseLoading, refetch: refetchCase } = trpc.cases.getById.useQuery({ id: caseId });
+  const { data: caseData, isLoading: caseLoading, refetch: refetchCase } = trpc.cases.getById.useQuery({ id: caseId }, { refetchInterval: 2000 });
   const { data: documents, refetch: refetchDocuments } = trpc.documents.list.useQuery({ caseId });
 
   const petalCatalogQuery = trpc.petals.catalog.useQuery();
-  const petalListQuery = trpc.petals.list.useQuery({ caseId });
+  const petalListQuery = trpc.petals.list.useQuery({ caseId }, { refetchInterval: 2000 });
+  const workflowQuery = trpc.cases.workflowStatus.useQuery({ caseId }, { refetchInterval: 1000 });
+  const refreshResearchOutputs = useCallback(() => {
+    void refreshResearchOutputCaches({
+      clearTrial: () => utils.cases.getTrialResult.setData({ caseId }, null),
+      clearHandoff: () => utils.cases.getHandoff.setData({ caseId }, null),
+      refreshPetals: () => utils.petals.list.invalidate({ caseId }),
+      refreshTrial: () => utils.cases.getTrialResult.invalidate({ caseId }),
+      refreshHandoff: () => utils.cases.getHandoff.invalidate({ caseId }),
+    }).catch(() => { /* Query error state and reconnect/polling supply the retry. */ });
+  }, [caseId, utils]);
   const {
     progressByKey: petalProgressByKey,
     isGrowing: petalsIsGrowing,
     seedFromList: seedPetalsFromList,
-  } = usePetalsSocket(caseId);
+  } = usePetalsSocket(caseId, refreshResearchOutputs);
+
+  const refreshWorkflow = useCallback(() => {
+    seedPetalsFromList([]);
+    resetTrial();
+    setTrialMode("idle");
+    utils.cases.getTrialResult.setData({ caseId }, null);
+    utils.cases.getHandoff.setData({ caseId }, null);
+    void utils.cases.invalidate();
+    void utils.petals.list.invalidate({ caseId });
+    void utils.documents.list.invalidate({ caseId });
+  }, [caseId, resetTrial, seedPetalsFromList, utils]);
 
   // ─────────────────────────── Mutations ───────────────────────────────────
   const uploadMutation = trpc.documents.upload.useMutation({
     onSuccess: () => {
-      refetchDocuments();
+      refreshWorkflow();
       toast.success("Document uploaded");
     },
     onError: (err) => toast.error(`Upload failed: ${err.message}`),
@@ -89,16 +112,20 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const analyzeFactsMutation = trpc.cases.analyzeFacts.useMutation({
     onSuccess: () => {
       toast.success("Case facts extracted.");
-      refetchCase();
-      refetchDocuments();
+      refreshWorkflow();
     },
     onError: (err) => toast.error(`Fact extraction failed: ${err.message}`),
   });
 
   const takeToTrialMutation = trpc.cases.takeToTrial.useMutation({
+    onSuccess: () => {
+      previousOperation.current = "trial";
+      void workflowQuery.refetch();
+    },
     onError: (err) => {
       toast.error(`Take to trial failed: ${err.message}`);
       setTrialMode("idle");
+      resetTrial();
     },
   });
 
@@ -114,7 +141,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     onSuccess: () => {
       toast.success("Case updated");
       setIsEditDialogOpen(false);
-      refetchCase();
+      refreshWorkflow();
     },
     onError: (err) => toast.error(`Update failed: ${err.message}`),
   });
@@ -129,34 +156,80 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   // ─────────────────────────── Effects ─────────────────────────────────────
   useEffect(() => {
-    if (petalListQuery.data && petalListQuery.data.length > 0) {
+    if (petalListQuery.data) {
       seedPetalsFromList(petalListQuery.data as any[]);
     }
   }, [petalListQuery.data, seedPetalsFromList]);
+
+  const previousGeneration = useRef<string | null>(null);
+  useEffect(() => {
+    if (!petalListQuery.data) return;
+    const generation = JSON.stringify(petalListQuery.data.map(row => [row.petalKey, row.corpusKey]).sort());
+    if (previousGeneration.current !== null && previousGeneration.current !== generation) {
+      refreshResearchOutputs();
+      if (workflowQuery.data !== "trial") {
+        resetTrial();
+        setTrialMode("idle");
+      }
+    }
+    previousGeneration.current = generation;
+  }, [petalListQuery.data, refreshResearchOutputs, resetTrial, workflowQuery.data]);
+
+  useEffect(() => {
+    if (caseData && !caseData.caseFacts) {
+      resetTrial();
+      setTrialMode("idle");
+      utils.cases.getTrialResult.setData({ caseId }, null);
+      utils.cases.getHandoff.setData({ caseId }, null);
+    }
+  }, [caseData?.caseFacts, caseId, resetTrial, utils]);
+
+  useEffect(() => {
+    if (trialState.kind === "complete" || trialState.kind === "error") {
+      void utils.cases.getTrialResult.invalidate({ caseId });
+      void utils.cases.getHandoff.invalidate({ caseId });
+      void workflowQuery.refetch();
+    }
+  }, [trialState.kind, caseId, utils]);
+
+  const previousOperation = useRef<string | null>(null);
+  useEffect(() => {
+    const operation = workflowQuery.data;
+    if (operation === "trial" && previousOperation.current !== "trial") {
+      markTrialRunning();
+      setTrialMode("active");
+    } else if (operation === null && previousOperation.current === "trial") {
+      void utils.cases.getTrialResult.fetch({ caseId }).then(reconcileTrial).catch(() => {
+        // Keep the reconciliation pending if connectivity drops between the
+        // status response and the result response; the next poll retries.
+        previousOperation.current = "trial";
+      });
+      void utils.cases.getHandoff.invalidate({ caseId });
+    }
+    previousOperation.current = operation ?? null;
+  }, [workflowQuery.data, workflowQuery.dataUpdatedAt, caseId, markTrialRunning, reconcileTrial, utils]);
 
   // ─────────────────────────── Derived state ───────────────────────────────
   const petalCatalog = petalCatalogQuery.data ?? [];
   const petalEntries = Object.values(petalProgressByKey);
   const hasAnyPetalProgress = petalEntries.length > 0;
   const buildingPetal = petalEntries.find((p) => p.status === "building") ?? null;
-  const isPetalsRunning = petalsIsGrowing || buildingPetal !== null;
+  const isPetalsRunning = workflowQuery.data === "grow" || petalsIsGrowing || buildingPetal !== null;
   const allPetalsBloomed =
-    hasAnyPetalProgress &&
+    petalEntries.length === petalCatalog.length && petalCatalog.length > 0 &&
     petalEntries.every((p) => p.status === "completed" || p.status === "skipped");
 
   const hasDocuments = (documents?.length ?? 0) > 0;
-  const isAnalyzingFacts = analyzeFactsMutation.isPending;
-  const isCaseAnalyzed = !!caseData?.caseFacts;
+  const isAnalyzingFacts = analyzeFactsMutation.isPending || workflowQuery.data === "analyze" || caseData?.status === "analyzing";
+  const isCaseAnalyzed = !!caseData?.caseFacts && caseData.status === "completed";
+  const isWorkflowBusy = !!workflowQuery.data || isPetalsRunning || isAnalyzingFacts || takeToTrialMutation.isPending || startPetalGrowthMutation.isPending;
+  const hasRetryableResearch = petalEntries.some(p => p.status === "failed" || !!p.errorMessage);
 
   /** Phase derived from the case + petals state — drives PrebloomCard rendering. */
   const phase: CasePhase = useMemo(() => {
-    if (allPetalsBloomed) return "bloomed";
-    if (isPetalsRunning) return "growing";
-    if (isCaseAnalyzed && !hasAnyPetalProgress) return "grow";
-    if (isAnalyzingFacts) return "analyzing";
-    if (hasDocuments) return "analyze";
-    return "upload";
-  }, [allPetalsBloomed, isPetalsRunning, isCaseAnalyzed, hasAnyPetalProgress, isAnalyzingFacts, hasDocuments]);
+    return deriveCasePhase({ hasDocuments, hasFacts: isCaseAnalyzed, analyzing: isAnalyzingFacts,
+      growing: isPetalsRunning, petals: petalEntries, expectedPetals: petalCatalog.length });
+  }, [isPetalsRunning, isCaseAnalyzed, isAnalyzingFacts, hasDocuments, petalEntries, petalCatalog.length]);
 
   /** Header status pill — mirrors `phase` but uses CaseStatus vocabulary. */
   const status: CaseStatus =
@@ -202,13 +275,16 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   // PrebloomCard's "Upload" button just triggers the hidden file input.
   const handleUploadClick = () => fileInputRef.current?.click();
   const handleAnalyze = () => analyzeFactsMutation.mutate({ caseId });
-  const handleBeginGrow = () => startPetalGrowthMutation.mutate({ caseId });
+  const handleBeginGrow = () => {
+    if (!isWorkflowBusy) startPetalGrowthMutation.mutate({ caseId });
+  };
   /** Take-to-Trial button — fires the orchestrator mutation and flips
    *  the right drawer into TakeToTrialPanel mode. The socket stream
    *  populates the panel; on completion the verdict reveals. */
   const handleTakeToTrial = () => {
-    if (!allPetalsBloomed) return;
+    if (!isCaseAnalyzed || !allPetalsBloomed || isWorkflowBusy) return;
     resetTrial();
+    markTrialRunning();
     setTrialMode("active");
     takeToTrialMutation.mutate({ caseId });
   };
@@ -313,7 +389,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
         id="file-upload"
         type="file"
         multiple
-        accept=".pdf,.docx,.txt"
+        accept=".pdf,.docx,.txt,.md,.markdown,.html,.htm"
         className="hidden"
         onChange={(e) => handleFileUpload(e.target.files)}
       />
@@ -367,7 +443,16 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
               onUpload={handleUploadClick}
               onAnalyze={handleAnalyze}
               onBeginGrow={handleBeginGrow}
+              growPending={isWorkflowBusy}
+              retryGrow={hasAnyPetalProgress}
             />
+          )}
+
+          {isBloomed && hasRetryableResearch && (
+            <div role="status" className="p-4 text-sm">
+              <p>A research retry failed. The previous completed sources are still available.</p>
+              <Button onClick={handleBeginGrow} disabled={isWorkflowBusy}>Retry research</Button>
+            </div>
           )}
 
           {isGrowing && (
@@ -405,7 +490,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       </div>
 
       {trialMode === "idle" && (
-        <TakeToTrial ready={isBloomed} onClick={handleTakeToTrial} />
+        <TakeToTrial ready={isBloomed && !isWorkflowBusy} onClick={handleTakeToTrial} />
       )}
 
       <OnboardingTour steps={caseDetailTourSteps} run={runTour} onFinish={markTourComplete} />

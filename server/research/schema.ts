@@ -131,9 +131,9 @@ export function validatePrimarySourceUrl(
     });
   }
 
-  if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) {
     throw new ResearchOutputError(
-      `Source URL must be an unauthenticated HTTPS URL: ${rawUrl}`
+      `Source URL must be an unauthenticated HTTPS URL on port 443: ${rawUrl}`
     );
   }
 
